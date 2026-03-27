@@ -1,0 +1,14 @@
+prefix=/home/admin/Work/Nim/Tests/PMI/ffmpeg_build
+exec_prefix=${prefix}
+libdir=/home/admin/Work/Nim/Tests/PMI/ffmpeg_build/lib
+includedir=/home/admin/Work/Nim/Tests/PMI/ffmpeg_build/include
+
+Name: libavfilter
+Description: FFmpeg audio/video filtering library
+Version: 11.13.100
+Requires: libswscale >= 9.4.100, libavformat >= 62.10.101, libavcodec >= 62.24.101, libswresample >= 6.2.100, libavutil >= 60.25.100
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lavfilter -pthread -lm -latomic
+Libs.private: 
+Cflags: -I${includedir}

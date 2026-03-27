@@ -1,0 +1,14 @@
+prefix=/home/admin/Work/Nim/Tests/PMI/ffmpeg_build
+exec_prefix=${prefix}
+libdir=/home/admin/Work/Nim/Tests/PMI/ffmpeg_build/lib
+includedir=/home/admin/Work/Nim/Tests/PMI/ffmpeg_build/include
+
+Name: libavutil
+Description: FFmpeg utility library
+Version: 60.25.100
+Requires: 
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lavutil -lm -latomic -pthread
+Libs.private: 
+Cflags: -I${includedir}
