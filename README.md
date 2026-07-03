@@ -68,7 +68,7 @@ make build
     ├── ffmpeg_build/        ← создаётся при сборке (config.nims или make build-ffmpeg)
     │   ├── include/
     │   └── lib/  *.a
-    └── PMI                  ← готовый бинарь (результат сборки)
+    └── PMI                  ← готовый бинарный файл (результат сборки)
 ```
 
 `PMI.nim` подключает соседние модули как `import src/[ffmpeg_api, worker, concat]`;
@@ -90,7 +90,7 @@ make check-deps
 # Шаг 1: статические .a библиотеки FFmpeg (~10-15 мин)
 make build-ffmpeg
 
-# Шаг 2: бинарь PMI
+# Шаг 2: бинарный файл PMI
 make build
 ```
 
@@ -135,11 +135,7 @@ make build-ffmpeg FFMPEG_SRC=/другой/путь/к/FFmpeg
 
 ## Кросс-компиляция под Windows (mingw-w64)
 
-Собранные под Linux `.a` в `ffmpeg_build/` (ELF) для Windows-бинаря не
-годятся — FFmpeg и x264 нужно пересобрать отдельно под mingw-w64, а затем
-кросс-скомпилировать `PMI.nim` под `--os:windows`. `config.nims` сейчас
-собирает FFmpeg только под хост-платформу, поэтому для Windows-сборки
-используется отдельная папка `ffmpeg_build_win/` и ручные шаги ниже.
+Собранные под Linux `.a` в `ffmpeg_build/` (ELF) для бинарного файла Windows не годятся — FFmpeg и x264 нужно пересобрать отдельно под mingw-w64, а затем кросс-скомпилировать `PMI.nim` под `--os:windows`. `config.nims` сейчас собирает FFmpeg только под хост-платформу, поэтому для Windows-сборки используется отдельная папка `ffmpeg_build_win/` и ручные шаги ниже.
 
 ### 1. Тулчейн на Fedora
 
