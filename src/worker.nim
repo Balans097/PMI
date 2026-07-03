@@ -68,6 +68,14 @@ type
     inTB*:      AVRational
 
     fg*:        FilterGraph
+    # Colorspace/range, выбранные ОДИН раз при построении фильтрграфа
+    # (buildFilterGraph) и переиспользуемые везде далее: их же мы
+    # прописываем в каждый decFrame перед отправкой в buffersrc (чтобы
+    # реальные кадры совпадали с тем, что было заявлено buffersrc при
+    # создании), и в encCtx — чтобы выходной файл был размечен тем же
+    # значением, а не «unspecified» из декодера.
+    outCsp*:    AVColorSpace
+    outRange*:  AVColorRange
 
     outFmt*:    ptr AVFormatContext
     encCtx*:    ptr AVCodecContext
@@ -91,13 +99,13 @@ proc buildFilterDesc(job: SegmentJob; inPixFmt: cint): string =
 # ------------------------------------------------------------------------------
 # Построение фильтрграфа
 # ------------------------------------------------------------------------------
-proc buildFilterGraph(fg: var FilterGraph;
+proc buildFilterGraph(p: var Pipeline;
                       decCtx: ptr AVCodecContext;
                       stream:  ptr AVStream;
                       job:     SegmentJob) =
 
-  fg.graph = avfilter_graph_alloc()
-  if fg.graph == nil:
+  p.fg.graph = avfilter_graph_alloc()
+  if p.fg.graph == nil:
     raise newException(IOError, "avfilter_graph_alloc failed")
 
   let bufFilt = avfilter_get_by_name("buffer")
@@ -110,10 +118,23 @@ proc buildFilterGraph(fg: var FilterGraph;
     # pixel_aspect (SAR) — если декодер его не сообщил, считаем 1/1
     parN = if decCtx.sample_aspect_ratio.den != 0: decCtx.sample_aspect_ratio.num else: 1
     parD = if decCtx.sample_aspect_ratio.den != 0: decCtx.sample_aspect_ratio.den else: 1
-    # Colorspace и range: берём из декодера; если не задан — дефолт bt709/tv.
-    # AVCOL_SPC_UNSPECIFIED=2, AVCOL_RANGE_UNSPECIFIED=0
-    cspInt   = if decCtx.colorspace.cint  != 2: decCtx.colorspace.cint  else: 1  # bt709
-    rangeInt = if decCtx.color_range.cint != 0: decCtx.color_range.cint else: 1  # tv
+    # Colorspace и range: на этом этапе декодер ещё НИЧЕГО не декодировал
+    # (buildFilterGraph вызывается сразу после avcodec_open2), поэтому
+    # decCtx.colorspace/color_range почти всегда "unspecified" — реальные
+    # значения появляются только в decFrame.colorspace/color_range уже
+    # ПОСЛЕ декодирования первого кадра (парсятся из VUI/SEI H.264).
+    # Поэтому здесь мы не читаем decCtx — сразу берём дефолт bt709/tv
+    # (типично для web-рипов без явной цветовой разметки) и далее
+    # ПРИНУДИТЕЛЬНО проставляем это же значение в каждый decFrame перед
+    # отправкой в buffersrc (см. вызовы av_buffersrc_add_frame_flags) —
+    # это убирает предупреждение "Changing video frame properties on
+    # the fly is not supported by all filters" и гарантирует, что
+    # выходной файл получит согласованную цветовую метку.
+    cspInt   = 1.cint  # AVCOL_SPC_BT709
+    rangeInt = 1.cint  # AVCOL_RANGE_MPEG (tv)
+
+  p.outCsp   = AVColorSpace(cspInt)
+  p.outRange = AVColorRange(rangeInt)
 
   let srcArgs = fmt"video_size={decCtx.width}x{decCtx.height}" &
                 fmt":pix_fmt={decCtx.pix_fmt.cint}" &
@@ -125,8 +146,8 @@ proc buildFilterGraph(fg: var FilterGraph;
 
   ffCheck(
     avfilter_graph_create_filter(
-      addr fg.srcCtx, bufFilt, "in",
-      srcArgs.cstring, nil, fg.graph),
+      addr p.fg.srcCtx, bufFilt, "in",
+      srcArgs.cstring, nil, p.fg.graph),
     "buffersrc create")
 
   let sinkFilt = avfilter_get_by_name("buffersink")
@@ -135,8 +156,8 @@ proc buildFilterGraph(fg: var FilterGraph;
 
   ffCheck(
     avfilter_graph_create_filter(
-      addr fg.sinkCtx, sinkFilt, "out",
-      nil, nil, fg.graph),
+      addr p.fg.sinkCtx, sinkFilt, "out",
+      nil, nil, p.fg.graph),
     "buffersink create")
   # pix_fmts задаётся через "format=pix_fmts=yuv420p" в строке фильтра —
   # av_opt_set на sinkCtx здесь неприменим (контекст уже инициализирован)
@@ -152,17 +173,17 @@ proc buildFilterGraph(fg: var FilterGraph;
     raise newException(IOError, "avfilter_inout_alloc failed")
 
   outputs.name       = av_strdup("in")
-  outputs.filter_ctx = fg.srcCtx
+  outputs.filter_ctx = p.fg.srcCtx
   outputs.pad_idx    = 0.cint
   outputs.next       = nil
 
   inputs.name        = av_strdup("out")
-  inputs.filter_ctx  = fg.sinkCtx
+  inputs.filter_ctx  = p.fg.sinkCtx
   inputs.pad_idx     = 0.cint
   inputs.next        = nil
 
   let ret = avfilter_graph_parse_ptr(
-    fg.graph, filterDesc.cstring,
+    p.fg.graph, filterDesc.cstring,
     addr inputs, addr outputs, nil)
 
   avfilter_inout_free(addr inputs)
@@ -173,7 +194,7 @@ proc buildFilterGraph(fg: var FilterGraph;
       "avfilter_graph_parse_ptr: " & ffErrStr(ret) &
       "  filter: [" & filterDesc & "]")
 
-  ffCheck(avfilter_graph_config(fg.graph, nil),
+  ffCheck(avfilter_graph_config(p.fg.graph, nil),
           "avfilter_graph_config")
 
 proc freeFilterGraph(fg: var FilterGraph) =
@@ -331,7 +352,7 @@ proc processSegment*(job: SegmentJob): SegmentResult =
     ffCheck(avcodec_open2(p.decCtx, codec, nil), "avcodec_open2 decoder")
 
     # ── 4. Фильтрграф ────────────────────────────────────────────────────
-    buildFilterGraph(p.fg, p.decCtx, inStream, job)
+    buildFilterGraph(p, p.decCtx, inStream, job)
 
     # ── 5. Выходной файл и энкодер ───────────────────────────────────────
     ffCheck(
@@ -361,8 +382,8 @@ proc processSegment*(job: SegmentJob): SegmentResult =
     p.encCtx.max_b_frames = 2.cint
     p.encCtx.thread_count = job.threadSlices.cint
     p.encCtx.thread_type  = (FF_THREAD_FRAME or FF_THREAD_SLICE).cint
-    p.encCtx.colorspace      = p.decCtx.colorspace
-    p.encCtx.color_range     = p.decCtx.color_range
+    p.encCtx.colorspace      = p.outCsp
+    p.encCtx.color_range     = p.outRange
     p.encCtx.color_primaries = p.decCtx.color_primaries
     p.encCtx.color_trc       = p.decCtx.color_trc
     p.encCtx.sample_aspect_ratio = p.decCtx.sample_aspect_ratio
@@ -456,6 +477,14 @@ proc processSegment*(job: SegmentJob): SegmentResult =
 
         inc frameCount
 
+        # Принудительно тегируем кадр тем же csp/range, что заявлен
+        # buffersrc при создании фильтрграфа (p.outCsp/p.outRange) —
+        # иначе libavfilter ругается "Changing video frame properties
+        # on the fly is not supported by all filters", т.к. реальный
+        # decFrame почти всегда несёт colorspace=unspecified.
+        decFrame.colorspace  = p.outCsp
+        decFrame.color_range = p.outRange
+
         let fr = av_buffersrc_add_frame_flags(
           p.fg.srcCtx, decFrame, AV_BUFFERSRC_FLAG_KEEP_REF)
         av_frame_unref(decFrame)
@@ -476,6 +505,8 @@ proc processSegment*(job: SegmentJob): SegmentResult =
         if rr == AVERROR_EAGAIN or rr == AVERROR_EOF: break
         if rr < 0: break
         inc frameCount
+        decFrame.colorspace  = p.outCsp
+        decFrame.color_range = p.outRange
         let fr = av_buffersrc_add_frame_flags(
           p.fg.srcCtx, decFrame, AV_BUFFERSRC_FLAG_KEEP_REF)
         av_frame_unref(decFrame)

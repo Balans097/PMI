@@ -204,7 +204,7 @@ type
     pkt_duration*: int64
     time_base*:  AVRational
     sample_rate*: cint
-    color_space*: AVColorSpace
+    colorspace*: AVColorSpace
     color_range*: AVColorRange
     color_primaries*: AVColorPrimaries
     color_trc*:  AVColorTransferCharacteristic

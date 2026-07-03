@@ -4,11 +4,6 @@
 Параллельно повышает FPS видео через `minterpolate`, кодирует в **x264**,
 аудио и субтитры копируются без изменений.
 
-
-
-## Интерфейс терминала
-![Интерфейс терминала](./archive/Screenshot.png)
-
 ---
 
 ## Быстрая сборка (v4)
@@ -28,8 +23,6 @@ nim c -d:release --threads:on PMI.nim
 Первый запуск займёт ~10-15 минут (клонирование + сборка FFmpeg).
 Повторные запуски пропускают этот шаг — `config.nims` проверяет наличие
 `ffmpeg_build/lib/*.a` и, если они уже собраны, сразу переходит к линковке.
-
-
 
 Если исходники FFmpeg уже лежат в нестандартном месте:
 
@@ -59,22 +52,24 @@ make build
 
 ```
 <родительская папка>/
-├── FFmpeg/               ← исходники FFmpeg
+├── FFmpeg/                 ← исходники FFmpeg (клонируются config.nims автоматически)
 └── PMI/
+    ├── PMI.nim              — оркестрация потоков (главный модуль)
+    ├── config.nims          — автоклон + автосборка FFmpeg (см. «Быстрая сборка»)
+    ├── Makefile              — ручная альтернатива config.nims (см. ниже)
     ├── src/
-    │   ├── PMI.nim        — оркестрация потоков
-    │   ├── worker.nim     — seek → decode → minterpolate → x264
-    │   ├── concat.nim     — склейка сегментов
-    │   └── ffmpeg_api.nim — Nim-обёртка над FFmpeg C API
-    ├── config.nims         — автоклон + автосборка FFmpeg (см. «Быстрая сборка»)
-    ├── scripts/
-    │   └── build_ffmpeg.sh
-    ├── ffmpeg_build/      — создаётся при make build-ffmpeg
+    │   ├── worker.nim       — seek → decode → minterpolate → x264
+    │   ├── concat.nim       — склейка сегментов
+    │   └── ffmpeg_api.nim   — Nim-обёртка над FFmpeg C API
+    ├── ffmpeg_build/        ← создаётся при сборке (config.nims или make build-ffmpeg)
     │   ├── include/
     │   └── lib/  *.a
-    ├── Makefile
-    └── PMI                ← готовый бинарь
+    └── PMI                  ← готовый бинарь (результат сборки)
 ```
+
+`PMI.nim` подключает соседние модули как `import src/[ffmpeg_api, worker, concat]`;
+сами `worker.nim`/`concat.nim` внутри `src/` импортируют `ffmpeg_api` обычным
+`import ffmpeg_api` — они лежат в одной папке, путь указывать не нужно.
 
 ---
 
