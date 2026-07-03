@@ -64,6 +64,11 @@ const
   AV_PIX_FMT_YUV444P*   = AVPixelFormat(5)
   AV_PIX_FMT_YUV420P10* = AVPixelFormat(63)
 
+  # AVPictureType: тип кадра в frame.pict_type. NONE означает «не задан» —
+  # это нужно энкодеру, чтобы он сам решал I/P/B по своей GOP-структуре,
+  # а не наследовал тип от исходного (уже интерпретированного) кадра.
+  AV_PICTURE_TYPE_NONE* = cint(0)
+
   AV_NOPTS_VALUE* = cast[int64](0x8000000000000000'u64)
   AV_TIME_BASE*   = 1_000_000
 

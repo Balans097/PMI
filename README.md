@@ -133,6 +133,122 @@ make build-ffmpeg FFMPEG_SRC=/другой/путь/к/FFmpeg
 
 ---
 
+## Кросс-компиляция под Windows (mingw-w64)
+
+Собранные под Linux `.a` в `ffmpeg_build/` (ELF) для Windows-бинаря не
+годятся — FFmpeg и x264 нужно пересобрать отдельно под mingw-w64, а затем
+кросс-скомпилировать `PMI.nim` под `--os:windows`. `config.nims` сейчас
+собирает FFmpeg только под хост-платформу, поэтому для Windows-сборки
+используется отдельная папка `ffmpeg_build_win/` и ручные шаги ниже.
+
+### 1. Тулчейн на Fedora
+
+```bash
+sudo dnf install -y mingw64-gcc mingw64-gcc-c++ mingw64-binutils \
+                     mingw64-winpthreads-static mingw64-zlib-static \
+                     mingw64-bzip2-static mingw64-headers \
+                     mingw64-pkg-config nasm yasm git make
+```
+
+### 2. Кросс-сборка x264
+
+```bash
+git clone https://code.videolan.org/videolan/x264.git ../x264-mingw
+cd ../x264-mingw
+
+./configure \
+  --host=x86_64-w64-mingw32 \
+  --cross-prefix=x86_64-w64-mingw32- \
+  --enable-static --disable-cli --disable-opencl \
+  --prefix="$(pwd)/../PMI/ffmpeg_build_win"
+
+make -j$(nproc)
+make install
+cd ../PMI
+```
+
+### 3. Кросс-сборка FFmpeg
+
+Та же ветка (`release/7.1`), тот же набор `--enable-*`, что в `Makefile`/
+`config.nims`, но **без `-march=native`** (это опция под хост-CPU, при
+кросс-сборке она бессмысленна/ломает сборку) и с явным кросс-тулчейном:
+
+```bash
+cd ../FFmpeg
+
+BUILD_WIN=$(pwd)/../PMI/ffmpeg_build_win
+export PKG_CONFIG_LIBDIR="$BUILD_WIN/lib/pkgconfig"
+
+./configure \
+  --prefix="$BUILD_WIN" \
+  --arch=x86_64 --target-os=mingw32 \
+  --cross-prefix=x86_64-w64-mingw32- \
+  --enable-cross-compile \
+  --pkg-config=pkg-config --pkg-config-flags="--static" \
+  --enable-static --disable-shared \
+  --enable-gpl --enable-version3 --enable-libx264 \
+  --disable-programs --disable-doc --disable-debug --disable-autodetect \
+  --enable-protocol=file \
+  --enable-demuxer=matroska,mov,mpegts,avi,flv,concat \
+  --enable-muxer=matroska,mp4,mov,avi,segment \
+  --enable-decoder=h264,hevc,mpeg4,mpeg2video,vp9,vp8,av1,aac,ac3,mp3,eac3,dts,opus,vorbis,flac,truehd,ass,ssa,srt,subrip,dvd_subtitle,hdmv_pgs_subtitle \
+  --enable-encoder=libx264 \
+  --enable-parser=h264,hevc,aac,ac3,mpegaudio,vp9,av1,mpeg4video \
+  --enable-filter=minterpolate,buffer,buffersink,scale,format,fps,setpts,fifo \
+  --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,aac_adtstoasc,extract_extradata \
+  --extra-cflags="-O3 -static" \
+  --extra-ldflags="-static -static-libgcc"
+
+make -j$(nproc)
+make install
+```
+
+### 4. Кросс-компиляция PMI.nim
+
+```bash
+LIB=ffmpeg_build_win/lib
+INC=ffmpeg_build_win/include
+
+nim c -d:release --opt:speed --threads:on --mm:orc \
+  --os:windows --cpu:amd64 \
+  --gcc.exe:x86_64-w64-mingw32-gcc \
+  --gcc.linkerexe:x86_64-w64-mingw32-gcc \
+  --passC:"-I$INC" \
+  --passL:"-Wl,--start-group" \
+  --passL:"$LIB/libavfilter.a" \
+  --passL:"$LIB/libavcodec.a" \
+  --passL:"$LIB/libavformat.a" \
+  --passL:"$LIB/libswscale.a" \
+  --passL:"$LIB/libswresample.a" \
+  --passL:"$LIB/libavutil.a" \
+  --passL:"$LIB/libx264.a" \
+  --passL:"-Wl,--end-group" \
+  --passL:"-lz -lbz2 -lm" \
+  --passL:"-lws2_32 -lsecur32 -lbcrypt -lole32 -lstrmiids -lksuser -lmfuuid -ldxva2 -levr" \
+  --passL:"-static -static-libgcc -static-libstdc++" \
+  -o:PMI.exe \
+  PMI.nim
+```
+
+Пояснения:
+
+- `--gcc.exe` / `--gcc.linkerexe` переключают Nim на `x86_64-w64-mingw32-gcc`
+  вместо системного `gcc` — это и есть собственно кросс-компиляция.
+- Группа `-Wl,--start-group … --end-group` нужна так же, как в Linux-сборке,
+  из-за циклических зависимостей между `.a`.
+- Дополнительные `-l...` (`ws2_32`, `secur32`, `bcrypt`, `ole32`,
+  `strmiids`, `ksuser`, `mfuuid`, `dxva2`, `evr`) — системные Windows-библиотеки,
+  которые требует FFmpeg на mingw (сеть, крипто, DirectShow/Media Foundation
+  линкуются безусловно даже при `--disable-programs`). Если линковщик
+  пожалуется на неразрешённые символы — добавляйте недостающую библиотеку
+  по имени функции из ошибки (`undefined reference to ...@...`).
+
+> **Важно:** пока `config.nims` не умеет собирать под mingw сам, поэтому при
+> кросс-сборке его лучше временно отключать/игнорировать и использовать
+> команду из шага 4 напрямую, указывая на `ffmpeg_build_win/`.
+
+---
+
 ## Стиль кода (v4)
 
 Во всех `.nim`-файлах проекта выдержаны единые соглашения:
@@ -175,6 +291,16 @@ make build-ffmpeg FFMPEG_SRC=/другой/путь/к/FFmpeg
 
 **av_strdup для имён FilterInOut** — FFmpeg ожидает heap-строки которые
 освобождает сам. В исходнике передавались стековые строковые литералы.
+
+**pict_type перед энкодером** — `filtFrame.pict_type`, унаследованный от
+исходного декодированного кадра (в источнике есть B-кадры), пробрасывался
+через фильтр-граф без изменений и попадал в `avcodec_send_frame`.
+libx264-обёртка трактует ненулевой `pict_type` как явное указание типа
+кадра, из-за чего на границах сегментов x264 ругался
+`specified frame type ... not compatible with keyframe interval`
+и сам принудительно менял тип. Перед кодированием `pict_type` теперь
+сбрасывается в `AV_PICTURE_TYPE_NONE`, чтобы x264 сам решал I/P/B по
+своей GOP-структуре.
 
 ### concat.nim
 

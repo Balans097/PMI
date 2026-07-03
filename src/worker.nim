@@ -224,6 +224,14 @@ proc writeFilteredFrame(p: var Pipeline;
   inc ptsCounter
   inc outFrameCount
 
+  # frame.pict_type наследуется от исходного декодированного кадра
+  # (в источнике есть B-кадры) и пробрасывается фильтром как есть.
+  # Если не сбросить его, libx264-обёртка трактует это как явное
+  # указание типа кадра и на границе GOP/сегмента ругается
+  # "specified frame type ... not compatible with keyframe interval",
+  # принудительно меняя тип сама. Явно отдаём решение x264.
+  filtFrame.pict_type = AV_PICTURE_TYPE_NONE
+
   let sr = avcodec_send_frame(p.encCtx, filtFrame)
   if sr < 0 and sr != AVERROR_EOF:
     echo fmt"[WARN] encode send_frame: {ffErrStr(sr)}"
