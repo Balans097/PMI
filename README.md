@@ -1,4 +1,4 @@
-# PMI — Parallel Motion Interpolate  (v4)
+# PMI — Parallel Motion Interpolate  (v1.2)
 
 Приложение на **Nim** со статической линковкой FFmpeg.  
 Параллельно повышает FPS видео через `minterpolate`, кодирует в **x264**,
