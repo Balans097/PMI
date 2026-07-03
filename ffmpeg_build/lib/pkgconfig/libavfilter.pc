@@ -1,7 +1,7 @@
-prefix=/home/admin/Work/Nim/Tests/PMI/ffmpeg_build
+prefix=/home/admin/Work/Nim/Projects/FrameInterpolation/PMI/ffmpeg_build
 exec_prefix=${prefix}
-libdir=/home/admin/Work/Nim/Tests/PMI/ffmpeg_build/lib
-includedir=/home/admin/Work/Nim/Tests/PMI/ffmpeg_build/include
+libdir=/home/admin/Work/Nim/Projects/FrameInterpolation/PMI/ffmpeg_build/lib
+includedir=/home/admin/Work/Nim/Projects/FrameInterpolation/PMI/ffmpeg_build/include
 
 Name: libavfilter
 Description: FFmpeg audio/video filtering library

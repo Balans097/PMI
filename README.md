@@ -1,10 +1,52 @@
-# PMI — Parallel Motion Interpolate  (v2)
+# PMI — Parallel Motion Interpolate  (v4)
 
 Приложение на **Nim** со статической линковкой FFmpeg.  
 Параллельно повышает FPS видео через `minterpolate`, кодирует в **x264**,
 аудио и субтитры копируются без изменений.
 
 ---
+
+## Быстрая сборка (v4)
+
+Начиная с v4 в проекте есть `config.nims` — NimScript-файл, который Nim
+компилятор выполняет автоматически перед сборкой. Он сам клонирует и
+собирает статический FFmpeg, если его ещё нет. Поэтому достаточно:
+
+```bash
+sudo dnf install -y nasm yasm gcc gcc-c++ make pkg-config \
+                    x264-devel zlib-devel bzip2-devel xz-devel nim git
+
+cd PMI/
+nim c -d:release --threads:on PMI.nim
+```
+
+Первый запуск займёт ~10-15 минут (клонирование + сборка FFmpeg).
+Повторные запуски пропускают этот шаг — `config.nims` проверяет наличие
+`ffmpeg_build/lib/*.a` и, если они уже собраны, сразу переходит к линковке.
+
+Если исходники FFmpeg уже лежат в нестандартном месте:
+
+```bash
+PMI_FFMPEG_SRC=/путь/к/FFmpeg nim c -d:release --threads:on PMI.nim
+```
+
+Ветка FFmpeg по умолчанию — `release/7.1`, зеркало GitHub
+(`github.com/FFmpeg/FFmpeg`); правится в начале `config.nims`
+(переменная `ffmpegBranch`).
+
+### Альтернатива: Makefile (ручное управление шагами)
+
+Если исходники FFmpeg уже клонированы вручную в `../FFmpeg/` и нужен
+явный контроль над шагами (например, CI), можно по-прежнему пользоваться
+Makefile — он не конфликтует с `config.nims`, но НЕ клонирует FFmpeg сам:
+
+```bash
+make check-deps
+make build-ffmpeg    # ~10-15 мин
+make build
+```
+
+
 
 ## Структура
 
@@ -17,6 +59,7 @@
     │   ├── worker.nim     — seek → decode → minterpolate → x264
     │   ├── concat.nim     — склейка сегментов
     │   └── ffmpeg_api.nim — Nim-обёртка над FFmpeg C API
+    ├── config.nims         — автоклон + автосборка FFmpeg (см. «Быстрая сборка»)
     ├── scripts/
     │   └── build_ffmpeg.sh
     ├── ffmpeg_build/      — создаётся при make build-ffmpeg
@@ -84,7 +127,26 @@ make build-ffmpeg FFMPEG_SRC=/другой/путь/к/FFmpeg
 
 ---
 
-## Ключевые исправления v2
+## Стиль кода (v4)
+
+Во всех `.nim`-файлах проекта выдержаны единые соглашения:
+
+- **Префиксный вызов функций**: `len(A)`, `find(str, ch)`, `extractFilename(path)` —
+  вместо `A.len()`, `str.find(ch)`, `path.extractFilename`. Точка используется
+  только для доступа к полям структур (`p.decCtx`, `job.outputFile`) и для
+  простых числовых конверсий (`x.float`, `x.cint`) — это идиоматичный для Nim
+  «каст», а не вызов метода.
+  Исключение — `echo "текст"`, как и оговорено.
+- **Блочные объявления**: два и более `const`/`let`/`var` подряд объединяются
+  в один блок с отступом, а не пишутся отдельными строками с повторением
+  ключевого слова.
+- **Групповые `import`**: модули из одной библиотеки — через `[]` одной строкой
+  (`import std/[strformat, os, math]`), локальные модули проекта — через
+  запятую (`import ffmpeg_api, worker, concat`).
+- Код обильно прокомментирован: пояснения к структурам данных, фазам
+  flush-пайплайна, единицам измерения PTS/DTS и т. д.
+
+
 
 ### worker.nim
 

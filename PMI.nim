@@ -1,25 +1,34 @@
 # ==============================================================================
-#  PMI.nim  — Parallel Motion Interpolate  (v3)
+#  PMI.nim  — Parallel Motion Interpolate  (v4)
 #
-#  ИЗМЕНЕНИЯ v3:
-#   • planSegments: сегменты планируются как [start, start+cleanDur) без overlap,
-#     overlap задаётся отдельным полем overlapAfter для контекста minterpolate.
-#   • SegmentJob содержит cleanDuration + overlapAfter вместо одного duration.
-#   • concatSegments принимает segDurs (реальные длительности из результатов)
-#     и targetFps для правильного рассчёта PTS.
-#   • Прогресс: выводим реальную durationSec из результата.
+#  ТОЧКА ВХОДА ПРИЛОЖЕНИЯ. Здесь происходит:
+#   1. Разбор аргументов командной строки (parseArgs).
+#   2. Проба входного видео через FFmpeg (probeVideo) — узнаём длительность,
+#      разрешение, FPS, число потоков в контейнере.
+#   3. Планирование сегментов (planSegments) — видео режется на N кусков,
+#      которые можно интерполировать параллельно, независимо друг от друга.
+#   4. Запуск по одному потоку ОС на сегмент (worker.processSegment),
+#      получение результатов через Channel.
+#   5. Склейка успешных сегментов в один файл (concat.concatSegments).
+#
+#  ИЗМЕНЕНИЯ v4 (относительно v3, см. README):
+#   • Стилевая правка исходного кода: везде префиксный синтаксис вызова
+#     функций (len(A) вместо A.len и т.п.), однострочные/блочные
+#     объявления const/let/var, сгруппированные import.
+#   • Добавлен config.nims — теперь достаточно команды
+#       nim c -d:release --threads:on PMI.nim
+#     чтобы автоматически склонировать и собрать статический FFmpeg,
+#     без обязательного использования Makefile (см. README).
 # ==============================================================================
 
 {.experimental: "parallel".}
 
 import std/[strformat, strutils, parseopt, os, math,
             times, monotimes, sequtils, algorithm]
-import ffmpeg_api
-import worker
-import concat
+import src/[ffmpeg_api, worker, concat]
 
 # ------------------------------------------------------------------------------
-# Конфигурация
+# Конфигурация приложения — заполняется из аргументов командной строки
 # ------------------------------------------------------------------------------
 type
   PMIConfig = object
@@ -32,12 +41,13 @@ type
     vsbmc:       int
     preset:      string
     crf:         int
-    numWorkers:  int    # 0 = auto
+    numWorkers:  int    # 0 = auto (по числу ядер CPU)
     tempDir:     string
     keepTemp:    bool
     verbose:     bool
 
 proc defaultConfig(): PMIConfig =
+  ## Значения по умолчанию — совпадают с теми, что описаны в README.
   PMIConfig(
     inputFile:   "input.mkv",
     outputFile:  "output.mkv",
@@ -54,20 +64,23 @@ proc defaultConfig(): PMIConfig =
     verbose:     false)
 
 # ------------------------------------------------------------------------------
-# Информация о видео
+# Информация о входном видео, полученная через avformat/avcodec probe
 # ------------------------------------------------------------------------------
 type
   VideoInfo = object
-    duration:  float
-    fps:       float
-    videoIdx:  int
+    duration:  float                # секунды
+    fps:       float                # средний FPS видеопотока
+    videoIdx:  int                  # индекс видеопотока внутри контейнера
     width:     int
     height:    int
-    codec:     string
-    nbStreams: int
-    fmtCtx:    ptr AVFormatContext
+    codec:     string               # имя декодера ("h264", "hevc", ...)
+    nbStreams: int                  # всего потоков в контейнере (видео+аудио+субтитры)
+    fmtCtx:    ptr AVFormatContext  # держим открытым до конца main() —
+                                     # нужен concat.nim для копирования аудио/субтитров
 
 proc probeVideo(path: string): VideoInfo =
+  ## Открывает контейнер, находит "лучший" видеопоток (av_find_best_stream)
+  ## и извлекает параметры, необходимые для планирования и кодирования.
   var fmtCtx: ptr AVFormatContext
   ffCheck(avformat_open_input(addr fmtCtx, path.cstring, nil, nil),
           "Не удалось открыть: " & path)
@@ -82,10 +95,10 @@ proc probeVideo(path: string): VideoInfo =
     avformat_close_input(addr fmtCtx)
     raise newException(IOError, "Видеопоток не найден: " & path)
 
-  let vStream = fmtCtx.streams[vidIdx]
-  let dur = if fmtCtx.duration > 0:
-    fmtCtx.duration.float / AV_TIME_BASE.float
-  else: 0.0
+  let
+    vStream = fmtCtx.streams[vidIdx]
+    dur = if fmtCtx.duration > 0: fmtCtx.duration.float / AV_TIME_BASE.float
+          else: 0.0
 
   result = VideoInfo(
     duration:  dur,
@@ -94,7 +107,7 @@ proc probeVideo(path: string): VideoInfo =
     width:     vStream.codecpar.width,
     height:    vStream.codecpar.height,
     codec:     if decoder != nil: $decoder.name else: "unknown",
-    nbStreams:  fmtCtx.nb_streams.int,
+    nbStreams: fmtCtx.nb_streams.int,
     fmtCtx:    fmtCtx)
 
 proc closeVideoInfo(vi: var VideoInfo) =
@@ -112,31 +125,38 @@ type
     overlapAfter:  float    # дополнительная зона чтения (для контекста minterp.)
     outFile:       string
 
-# minterpolate нужен контекст: читаем overlapAfter секунд за пределами сегмента
-const OVERLAP_AFTER  = 2.0
-const MIN_SEG_DURATION = 4.0   # минимальная «чистая» длительность сегмента
+const
+  # minterpolate нужен контекст: читаем overlapAfter секунд за пределами сегмента
+  OVERLAP_AFTER    = 2.0
+  MIN_SEG_DURATION = 4.0   # минимальная «чистая» длительность сегмента
 
 proc planSegments(vi:       VideoInfo;
                   numSeg:   int;
                   tempDir:  string;
                   baseName: string): seq[Segment] =
-
-  let totalDur  = vi.duration
-  let actualSeg = min(numSeg, max(1, int(totalDur / MIN_SEG_DURATION)))
-  let segDur    = totalDur / actualSeg.float
+  ## Делит видео на numSeg (или меньше — если видео слишком короткое)
+  ## непересекающихся «чистых» кусков [start, start+cleanDur). Overlap
+  ## задаётся отдельно (overlapAfter) — это зона ЧТЕНИЯ сверх сегмента,
+  ## нужная minterpolate для сглаживания на стыках; в выходной файл
+  ## сегмента она не попадает (см. worker.nim: drainFilter).
+  let
+    totalDur  = vi.duration
+    actualSeg = min(numSeg, max(1, int(totalDur / MIN_SEG_DURATION)))
+    segDur    = totalDur / actualSeg.float
 
   if actualSeg < numSeg:
     echo fmt"[INFO] Сокращаем до {actualSeg} сегментов " &
          fmt"(видео {totalDur:.1f}с, мин. {MIN_SEG_DURATION}с/сегм.)"
 
   for i in 0..<actualSeg:
-    let startSec    = i.float * segDur
-    let cleanDurSec = if i < actualSeg - 1: segDur
-                      else: totalDur - startSec   # последний сегмент — до конца
-    # Последний сегмент не нуждается в overlap после себя
-    let overlapAfter = if i < actualSeg - 1: OVERLAP_AFTER else: 0.0
+    let
+      startSec    = i.float * segDur
+      cleanDurSec = if i < actualSeg - 1: segDur
+                    else: totalDur - startSec   # последний сегмент — до конца
+      # Последний сегмент не нуждается в overlap после себя
+      overlapAfter = if i < actualSeg - 1: OVERLAP_AFTER else: 0.0
 
-    result.add(Segment(
+    add(result, Segment(
       idx:          i,
       startSec:     startSec,
       cleanDurSec:  cleanDurSec,
@@ -147,17 +167,19 @@ proc planSegments(vi:       VideoInfo;
 # Утилиты вывода
 # ------------------------------------------------------------------------------
 proc bar(done, total: int; width = 40): string =
+  ## Текстовый прогресс-бар вида [████░░░░].
   let f = if total > 0: (done * width) div total else: 0
-  "[" & "█".repeat(f) & "░".repeat(width - f) & "]"
+  "[" & repeat("█", f) & repeat("░", width - f) & "]"
 
 proc fmtTime(sec: float): string =
+  ## Форматирует секунды в ЧЧ:ММ:СС.
   let s = max(0, sec.int)
   fmt"{s div 3600:02d}:{(s mod 3600) div 60:02d}:{s mod 60:02d}"
 
 proc printBanner(cfg: PMIConfig; vi: VideoInfo; nw: int) =
-  echo "═".repeat(64)
+  echo repeat("═", 64)
   echo "  PMI — Parallel Motion Interpolate"
-  echo "═".repeat(64)
+  echo repeat("═", 64)
   echo fmt"  Вход:        {cfg.inputFile}"
   echo fmt"  Выход:       {cfg.outputFile}"
   echo fmt"  Видео:       {vi.width}×{vi.height}  {vi.fps:.3f} fps  {fmtTime(vi.duration)}"
@@ -166,18 +188,20 @@ proc printBanner(cfg: PMIConfig; vi: VideoInfo; nw: int) =
   echo fmt"  mi_mode={cfg.miMode}  mc={cfg.mcMode}  me={cfg.meMode}  vsbmc={cfg.vsbmc}"
   echo fmt"  x264: CRF={cfg.crf}  preset={cfg.preset}"
   echo fmt"  Потоков:     {nw}  (av_cpu_count={av_cpu_count()})"
-  echo "═".repeat(64)
+  echo repeat("═", 64)
 
 # ------------------------------------------------------------------------------
 # Парсинг аргументов
 # ------------------------------------------------------------------------------
 proc parseArgs(): PMIConfig =
   result = defaultConfig()
-  var p = initOptParser(commandLineParams())
-  var inputSet  = false
-  var outputSet = false
+  var
+    p         = initOptParser(commandLineParams())
+    inputSet  = false
+    outputSet = false
+
   while true:
-    p.next()
+    next(p)
     case p.kind
     of cmdEnd: break
     of cmdArgument:
@@ -194,7 +218,7 @@ proc parseArgs(): PMIConfig =
           inputSet = true
         else:
           # "-i filename" через пробел — следующий токен
-          p.next()
+          next(p)
           if p.kind == cmdArgument:
             result.inputFile = p.key
             inputSet = true
@@ -204,7 +228,7 @@ proc parseArgs(): PMIConfig =
           result.outputFile = v
           outputSet = true
         else:
-          p.next()
+          next(p)
           if p.kind == cmdArgument:
             result.outputFile = p.key
             outputSet = true
@@ -255,7 +279,7 @@ PMI — Parallel Motion Interpolate
   --temp-dir=DIR       Папка сегментов (default: .pmi_tmp_*)
   --keep-temp          Не удалять сегменты
   -v, --verbose        AV_LOG_INFO
-  -h, --help           Эта справка
+  -h, --help            Эта справка
 """
         quit(0)
       else:
@@ -277,9 +301,9 @@ proc main() =
 
   av_log_set_level(if cfg.verbose: AV_LOG_INFO else: AV_LOG_WARNING)
 
-  let cpuCount   = av_cpu_count().int
-  let numWorkers = if cfg.numWorkers > 0: cfg.numWorkers
-                   else: max(1, cpuCount)
+  let
+    cpuCount   = av_cpu_count().int
+    numWorkers = if cfg.numWorkers > 0: cfg.numWorkers else: max(1, cpuCount)
 
   var vi = probeVideo(cfg.inputFile)
   defer: closeVideoInfo(vi)
@@ -293,26 +317,28 @@ proc main() =
 
   printBanner(cfg, vi, numWorkers)
 
-  let outDir  = cfg.outputFile.parentDir
-  let outBase = cfg.outputFile.splitFile.name
-  let tempDir = if cfg.tempDir != "": cfg.tempDir
-                else: (if outDir == "": "." else: outDir) / fmt".pmi_tmp_{outBase}"
+  let
+    outDir  = parentDir(cfg.outputFile)
+    outBase = splitFile(cfg.outputFile).name
+    tempDir = if cfg.tempDir != "": cfg.tempDir
+              else: (if outDir == "": "." else: outDir) / fmt".pmi_tmp_{outBase}"
 
   createDir(tempDir)
   defer:
     if not cfg.keepTemp and dirExists(tempDir):
       removeDir(tempDir)
 
-  let segments   = planSegments(vi, numWorkers, tempDir, outBase)
-  let actualSegs = segments.len
+  let
+    segments   = planSegments(vi, numWorkers, tempDir, outBase)
+    actualSegs = len(segments)
 
   echo fmt"[INFO] Длительность: {fmtTime(vi.duration)}"
   echo fmt"[INFO] Сегментов:    {actualSegs}  " &
        fmt"(≈{fmtTime(vi.duration / actualSegs.float)} каждый)"
   echo ""
 
-  resultChan.open(actualSegs)
-  defer: resultChan.close()
+  open(resultChan, actualSegs)
+  defer: close(resultChan)
 
   let slicesPerWorker = max(1, cpuCount div max(1, actualSegs))
   var threads = newSeq[Thread[SegmentJob]](actualSegs)
@@ -338,23 +364,25 @@ proc main() =
 
     createThread(threads[i], workerThread, job)
     echo fmt"[LAUNCH] Поток {i:2d} | start={fmtTime(seg.startSec)}" &
-         fmt" clean={fmtTime(seg.cleanDurSec)} → {seg.outFile.extractFilename}"
+         fmt" clean={fmtTime(seg.cleanDurSec)} → {extractFilename(seg.outFile)}"
 
   echo ""
 
-  var results   = newSeq[SegmentResult](actualSegs)
-  var doneCount = 0
-  var errors:   seq[string] = @[]
+  var
+    results   = newSeq[SegmentResult](actualSegs)
+    doneCount = 0
+    errors:   seq[string] = @[]
 
   while doneCount < actualSegs:
-    let res = resultChan.recv()
+    let res = recv(resultChan)
     results[res.jobId] = res
     inc doneCount
 
-    let elapsed = (getMonoTime() - wallStart).inSeconds.float
-    let eta = if doneCount < actualSegs:
-      elapsed / doneCount.float * (actualSegs - doneCount).float
-    else: 0.0
+    let
+      elapsed = inSeconds(getMonoTime() - wallStart).float
+      eta = if doneCount < actualSegs:
+        elapsed / doneCount.float * (actualSegs - doneCount).float
+      else: 0.0
 
     if res.success:
       let sz = if fileExists(res.outputFile):
@@ -365,18 +393,18 @@ proc main() =
            fmt" | {sz} МБ | ETA {fmtTime(eta)}  {bar(doneCount, actualSegs)}"
     else:
       echo fmt"[FAIL  {doneCount:2d}/{actualSegs}] Сег.{res.jobId:02d}: {res.errorMsg}"
-      errors.add(fmt"Segment {res.jobId}: {res.errorMsg}")
+      add(errors, fmt"Segment {res.jobId}: {res.errorMsg}")
 
   for i in 0..<actualSegs: joinThread(threads[i])
 
-  let wallElapsed = (getMonoTime() - wallStart).inSeconds.float
+  let wallElapsed = inSeconds(getMonoTime() - wallStart).float
   echo ""
   echo fmt"[INFO] Потоки завершены за {fmtTime(wallElapsed)}"
 
-  if errors.len > 0:
-    echo fmt"[ERROR] {errors.len}/{actualSegs} сегментов провалились"
+  if len(errors) > 0:
+    echo fmt"[ERROR] {len(errors)}/{actualSegs} сегментов провалились"
     for e in errors: echo fmt"  • {e}"
-    if errors.len == actualSegs:
+    if len(errors) == actualSegs:
       echo "[ERROR] Все сегменты провалились."
       quit(1)
     echo "[WARN] Склеиваем успешные сегменты..."
@@ -384,22 +412,23 @@ proc main() =
   echo ""
   echo "[CONCAT] Начинаем склейку..."
 
-  let sortedResults = results.sortedByIt(it.jobId)
+  let sortedResults = sortedByIt(results, it.jobId)
 
-  let segFiles = sortedResults
-    .filterIt(it.success and fileExists(it.outputFile))
-    .mapIt(it.outputFile)
+  # Реальные длительности успешных сегментов (в секундах) — идут парой
+  # с segFiles: индекс i в обоих seq соответствует одному и тому же сегменту.
+  let
+    segFiles = mapIt(
+      filterIt(sortedResults, it.success and fileExists(it.outputFile)),
+      it.outputFile)
+    segDurs = mapIt(
+      filterIt(sortedResults, it.success and fileExists(it.outputFile)),
+      it.durationSec)
 
-  # Реальные длительности успешных сегментов (в секундах)
-  let segDurs = sortedResults
-    .filterIt(it.success and fileExists(it.outputFile))
-    .mapIt(it.durationSec)
-
-  if segFiles.len == 0:
+  if len(segFiles) == 0:
     echo "[ERROR] Нет успешных сегментов."
     quit(1)
 
-  concat.concatSegments(
+  concatSegments(
     segFiles   = segFiles,
     segDurs    = segDurs,
     srcFile    = cfg.inputFile,
@@ -408,17 +437,18 @@ proc main() =
     videoIdx   = vi.videoIdx,
     targetFps  = cfg.targetFps)
 
-  let totalWall = (getMonoTime() - wallStart).inSeconds.float
+  let totalWall = inSeconds(getMonoTime() - wallStart).float
   let outSize   = if fileExists(cfg.outputFile):
     getFileSize(cfg.outputFile) div (1024*1024) else: 0i64
 
-  let inFrames  = results.filterIt(it.success).mapIt(it.frameCount).foldl(a+b, 0i64)
-  let outFrames = results.filterIt(it.success).mapIt(it.outFrameCount).foldl(a+b, 0i64)
+  let
+    inFrames  = foldl(mapIt(filterIt(results, it.success), it.frameCount), a + b, 0i64)
+    outFrames = foldl(mapIt(filterIt(results, it.success), it.outFrameCount), a + b, 0i64)
 
   echo ""
-  echo "═".repeat(64)
+  echo repeat("═", 64)
   echo "  PMI — Готово!"
-  echo "═".repeat(64)
+  echo repeat("═", 64)
   echo fmt"  Выходной файл:  {cfg.outputFile}  ({outSize} МБ)"
   echo fmt"  Общее время:    {fmtTime(totalWall)}"
   echo fmt"  Ускорение:      ×{vi.duration / max(1.0, totalWall):.2f} к реальному"
@@ -426,7 +456,7 @@ proc main() =
   echo fmt"  Кадров выход:   {outFrames}"
   if inFrames > 0:
     echo fmt"  Мультипликатор: ×{outFrames.float / inFrames.float:.2f}"
-  echo "═".repeat(64)
+  echo repeat("═", 64)
 
 when isMainModule:
   main()
