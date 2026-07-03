@@ -5,8 +5,8 @@ includedir=/home/admin/Work/Nim/Projects/FrameInterpolation/PMI/ffmpeg_build/inc
 
 Name: libswscale
 Description: FFmpeg image rescaling library
-Version: 9.4.100
-Requires: libavutil >= 60.25.100
+Version: 8.3.100
+Requires: libavutil >= 59.39.100
 Requires.private: 
 Conflicts:
 Libs: -L${libdir}  -lswscale -lm -latomic

@@ -1,5 +1,5 @@
 # ==============================================================================
-#  PMI.nim  — Parallel Motion Interpolate  (v4)
+#  PMI.nim  — Parallel Motion Interpolate  (v1.2)
 #
 #  ТОЧКА ВХОДА ПРИЛОЖЕНИЯ. Здесь происходит:
 #   1. Разбор аргументов командной строки (parseArgs).
@@ -11,7 +11,7 @@
 #      получение результатов через Channel.
 #   5. Склейка успешных сегментов в один файл (concat.concatSegments).
 #
-#  ИЗМЕНЕНИЯ v4 (относительно v3, см. README):
+#  ИЗМЕНЕНИЯ v1.2 (относительно v1.1, см. README):
 #   • Стилевая правка исходного кода: везде префиксный синтаксис вызова
 #     функций (len(A) вместо A.len и т.п.), однострочные/блочные
 #     объявления const/let/var, сгруппированные import.
@@ -97,12 +97,29 @@ proc probeVideo(path: string): VideoInfo =
 
   let
     vStream = fmtCtx.streams[vidIdx]
-    dur = if fmtCtx.duration > 0: fmtCtx.duration.float / AV_TIME_BASE.float
-          else: 0.0
+    fps     = getStreamFps(vStream)
+    # fmtCtx.duration (контейнерный уровень) часто отсутствует/ненадёжен
+    # у TS/broadcast-подобных источников (см. отчёт, находка #12) — раньше
+    # это приводило к duration=0.0 и жёсткому отказу "видео слишком
+    # короткое" даже для полноценных многочасовых записей. Пробуем более
+    # надёжные источники по очереди, прежде чем сдаться:
+    #   1) fmtCtx.duration — обычно точнее всего, когда есть;
+    #   2) stream.duration в единицах stream.time_base — доступен чаще,
+    #      даже когда контейнер не знает общую длительность;
+    #   3) stream.nb_frames / fps — грубая оценка по числу кадров.
+    dur =
+      if fmtCtx.duration > 0:
+        fmtCtx.duration.float / AV_TIME_BASE.float
+      elif vStream.duration > 0:
+        vStream.duration.float * av_q2d(vStream.time_base)
+      elif vStream.nb_frames > 0 and fps > 0.0:
+        vStream.nb_frames.float / fps
+      else:
+        0.0
 
   result = VideoInfo(
     duration:  dur,
-    fps:       getStreamFps(vStream),
+    fps:       fps,
     videoIdx:  vidIdx,
     width:     vStream.codecpar.width,
     height:    vStream.codecpar.height,
@@ -176,13 +193,14 @@ proc fmtTime(sec: float): string =
   let s = max(0, sec.int)
   fmt"{s div 3600:02d}:{(s mod 3600) div 60:02d}:{s mod 60:02d}"
 
-proc printBanner(cfg: PMIConfig; vi: VideoInfo; nw: int) =
+proc printBanner(cfg: PMIConfig; vi: VideoInfo; nw: int; durationUnknown: bool) =
   echo repeat("═", 64)
   echo "  PMI — Parallel Motion Interpolate"
   echo repeat("═", 64)
   echo fmt"  Вход:        {cfg.inputFile}"
   echo fmt"  Выход:       {cfg.outputFile}"
-  echo fmt"  Видео:       {vi.width}×{vi.height}  {vi.fps:.3f} fps  {fmtTime(vi.duration)}"
+  let durStr = if durationUnknown: "неизвестна" else: fmtTime(vi.duration)
+  echo fmt"  Видео:       {vi.width}×{vi.height}  {vi.fps:.3f} fps  {durStr}"
   echo fmt"  Кодек вх.:   {vi.codec}  потоков всего: {vi.nbStreams}"
   echo fmt"  Целевой FPS: {cfg.targetFps}"
   echo fmt"  mi_mode={cfg.miMode}  mc={cfg.mcMode}  me={cfg.meMode}  vsbmc={cfg.vsbmc}"
@@ -200,6 +218,19 @@ proc parseArgs(): PMIConfig =
     inputSet  = false
     outputSet = false
 
+  proc optVal(p: var OptParser): string =
+    ## p.val возвращает пустую строку для "-j 4" / "--fps 60" (значение через
+    ## пробел, не через '='). В этом случае вручную забираем следующий токен,
+    ## как это уже делалось только для -i/-o. Без этого числовые/строковые
+    ## опции через пробел молча остаются со значением по умолчанию, а сам
+    ## токен-значение потом ошибочно трактуется как позиционный аргумент.
+    if p.val != "":
+      return p.val
+    next(p)
+    if p.kind == cmdArgument:
+      return p.key
+    return ""
+
   while true:
     next(p)
     case p.kind
@@ -212,43 +243,36 @@ proc parseArgs(): PMIConfig =
     of cmdShortOption, cmdLongOption:
       case p.key
       of "i", "input":
-        let v = p.val
+        let v = optVal(p)
         if v != "":
           result.inputFile = v
           inputSet = true
-        else:
-          # "-i filename" через пробел — следующий токен
-          next(p)
-          if p.kind == cmdArgument:
-            result.inputFile = p.key
-            inputSet = true
       of "o", "output":
-        let v = p.val
+        let v = optVal(p)
         if v != "":
           result.outputFile = v
           outputSet = true
-        else:
-          next(p)
-          if p.kind == cmdArgument:
-            result.outputFile = p.key
-            outputSet = true
       of "fps":
-        try: result.targetFps = parseInt(p.val)
-        except: echo "[WARN] Неверный fps: " & p.val
+        let v = optVal(p)
+        try: result.targetFps = parseInt(v)
+        except: echo "[WARN] Неверный fps: " & v
       of "j", "jobs":
-        try: result.numWorkers = parseInt(p.val)
-        except: echo "[WARN] Неверное число jobs: " & p.val
-      of "preset":       result.preset    = p.val
+        let v = optVal(p)
+        try: result.numWorkers = parseInt(v)
+        except: echo "[WARN] Неверное число jobs: " & v
+      of "preset":       result.preset    = optVal(p)
       of "crf":
-        try: result.crf = parseInt(p.val)
-        except: discard
-      of "mi-mode":      result.miMode    = p.val
-      of "mc-mode":      result.mcMode    = p.val
-      of "me-mode":      result.meMode    = p.val
+        let v = optVal(p)
+        try: result.crf = parseInt(v)
+        except: echo "[WARN] Неверный crf: " & v
+      of "mi-mode":      result.miMode    = optVal(p)
+      of "mc-mode":      result.mcMode    = optVal(p)
+      of "me-mode":      result.meMode    = optVal(p)
       of "vsbmc":
-        try: result.vsbmc = parseInt(p.val)
-        except: discard
-      of "temp-dir":     result.tempDir   = p.val
+        let v = optVal(p)
+        try: result.vsbmc = parseInt(v)
+        except: echo "[WARN] Неверный vsbmc: " & v
+      of "temp-dir":     result.tempDir   = optVal(p)
       of "keep-temp":    result.keepTemp  = true
       of "v", "verbose": result.verbose   = true
       of "h", "help":
@@ -295,8 +319,51 @@ proc main() =
     echo fmt"[ERROR] Файл не найден: {cfg.inputFile}"
     quit(1)
 
+  # Защита от перезаписи входного файла: сравниваем абсолютные,
+  # нормализованные пути (не просто строковое равенство "input.mkv" ==
+  # "./input.mkv", которое пропустило бы очевидный кейс).
+  if absolutePath(cfg.inputFile) == absolutePath(cfg.outputFile):
+    echo fmt"[ERROR] Входной и выходной файл совпадают: {cfg.inputFile}"
+    quit(1)
+
   if cfg.targetFps < 1 or cfg.targetFps > 240:
     echo fmt"[ERROR] Неверный fps={cfg.targetFps}"
+    quit(1)
+
+  if cfg.crf < 0 or cfg.crf > 51:
+    echo fmt"[ERROR] Неверный crf={cfg.crf} (допустимо 0..51)"
+    quit(1)
+
+  if cfg.vsbmc notin [0, 1]:
+    echo fmt"[ERROR] Неверный vsbmc={cfg.vsbmc} (допустимо 0 или 1)"
+    quit(1)
+
+  const validMiModes  = ["mci", "blend", "dup"]
+  const validMcModes  = ["aobmc", "obmc"]
+  const validMeModes  = ["bidir", "bilat"]
+  const validPresets  = ["ultrafast", "superfast", "veryfast", "faster",
+                          "fast", "medium", "slow", "slower", "veryslow", "placebo"]
+
+  if cfg.miMode notin validMiModes:
+    echo fmt"[ERROR] Неверный --mi-mode={cfg.miMode} (допустимо: {validMiModes})"
+    quit(1)
+  if cfg.mcMode notin validMcModes:
+    echo fmt"[ERROR] Неверный --mc-mode={cfg.mcMode} (допустимо: {validMcModes})"
+    quit(1)
+  if cfg.meMode notin validMeModes:
+    echo fmt"[ERROR] Неверный --me-mode={cfg.meMode} (допустимо: {validMeModes})"
+    quit(1)
+  if cfg.preset notin validPresets:
+    echo fmt"[ERROR] Неверный --preset={cfg.preset} (допустимо: {validPresets})"
+    quit(1)
+
+  # Верхняя граница --jobs: без неё пользователь может случайно запросить
+  # сотни ОС-потоков (по одному воркеру на сегмент + внутренние потоки
+  # декодера/энкодера в каждом), что скорее навредит производительности,
+  # чем поможет (см. README/отчёт, "Performance Findings" #7).
+  const MAX_JOBS = 64
+  if cfg.numWorkers < 0 or cfg.numWorkers > MAX_JOBS:
+    echo fmt"[ERROR] Неверный --jobs={cfg.numWorkers} (допустимо 1..{MAX_JOBS}, 0=авто)"
     quit(1)
 
   av_log_set_level(if cfg.verbose: AV_LOG_INFO else: AV_LOG_WARNING)
@@ -308,14 +375,36 @@ proc main() =
   var vi = probeVideo(cfg.inputFile)
   defer: closeVideoInfo(vi)
 
-  if vi.duration < MIN_SEG_DURATION:
+  # Раньше duration==0.0 (контейнер/поток не сообщают длительность — типично
+  # для TS/broadcast-источников) неотличимо трактовалось как "видео короче
+  # 4 секунд" и приводило к жёсткому отказу, хотя README документирует
+  # поддержку именно таких TS-источников (см. отчёт, находка #12).
+  #
+  # Явный "неизвестно" (0.0) больше не считается "слишком коротким". Но
+  # многосегментное планирование по большой оценке-заглушке было бы опасно:
+  # все сегменты, кроме первого, стартовали бы far beyond реального EOF,
+  # их воркеры ничего не декодировали бы и завершались с ошибкой — а после
+  # фикса находки #3 (полный отказ при любом упавшем сегменте, см. main())
+  # это привело бы к отказу всего прогона. Поэтому при неизвестной
+  # длительности принудительно используем один сегмент (без параллелизма):
+  # единственный воркер честно читает файл до настоящего EOF.
+  var unknownDuration = false
+  const UNKNOWN_DURATION_FALLBACK = 24.0 * 3600.0  # только для планирования
+  if vi.duration <= 0.0:
+    echo "[WARN] Не удалось определить длительность видео " &
+         "(контейнер/поток её не сообщают) — сегментация отключена " &
+         "(--jobs игнорируется), файл будет обработан одним потоком."
+    vi.duration = UNKNOWN_DURATION_FALLBACK
+    unknownDuration = true
+  elif vi.duration < MIN_SEG_DURATION:
     echo fmt"[ERROR] Видео слишком короткое ({vi.duration:.1f}с)"
     quit(1)
 
   if vi.fps >= cfg.targetFps.float - 0.5:
     echo fmt"[WARN] Входной FPS ({vi.fps:.2f}) >= целевого ({cfg.targetFps})"
 
-  printBanner(cfg, vi, numWorkers)
+  let effectiveWorkers = if unknownDuration: 1 else: numWorkers
+  printBanner(cfg, vi, effectiveWorkers, unknownDuration)
 
   let
     outDir  = parentDir(cfg.outputFile)
@@ -323,18 +412,28 @@ proc main() =
     tempDir = if cfg.tempDir != "": cfg.tempDir
               else: (if outDir == "": "." else: outDir) / fmt".pmi_tmp_{outBase}"
 
+  # Удаляем temp-dir на выходе ТОЛЬКО если он не существовал до этого запуска
+  # и мы сами его создали — иначе `--temp-dir=/tmp` (или любой другой уже
+  # существующий/общий каталог) мог бы быть рекурсивно удалён целиком со
+  # всем посторонним содержимым. Если каталог уже существовал, PMI никогда
+  # не удаляет его сам, вне зависимости от --keep-temp.
+  let tempDirPreexisted = dirExists(tempDir)
   createDir(tempDir)
   defer:
-    if not cfg.keepTemp and dirExists(tempDir):
+    if not tempDirPreexisted and not cfg.keepTemp and dirExists(tempDir):
       removeDir(tempDir)
 
   let
-    segments   = planSegments(vi, numWorkers, tempDir, outBase)
+    segments   = planSegments(vi, effectiveWorkers, tempDir, outBase)
     actualSegs = len(segments)
 
-  echo fmt"[INFO] Длительность: {fmtTime(vi.duration)}"
-  echo fmt"[INFO] Сегментов:    {actualSegs}  " &
-       fmt"(≈{fmtTime(vi.duration / actualSegs.float)} каждый)"
+  echo fmt"[INFO] Длительность: " &
+       (if unknownDuration: "неизвестна (TS/broadcast?)" else: fmtTime(vi.duration))
+  if actualSegs > 1:
+    echo fmt"[INFO] Сегментов:    {actualSegs}  " &
+         fmt"(≈{fmtTime(vi.duration / actualSegs.float)} каждый)"
+  else:
+    echo fmt"[INFO] Сегментов:    {actualSegs} (без сегментации)"
   echo ""
 
   open(resultChan, actualSegs)
@@ -404,10 +503,19 @@ proc main() =
   if len(errors) > 0:
     echo fmt"[ERROR] {len(errors)}/{actualSegs} сегментов провалились"
     for e in errors: echo fmt"  • {e}"
-    if len(errors) == actualSegs:
-      echo "[ERROR] Все сегменты провалились."
-      quit(1)
-    echo "[WARN] Склеиваем успешные сегменты..."
+    # Раньше PMI склеивал оставшиеся успешные сегменты даже при частичном
+    # провале. Это приводило к тихой потере кусков видео: индексы и
+    # временные разрывы неудавшихся сегментов нигде не сохраняются, и
+    # concatSegments не может ни вставить видимый пропуск, ни хотя бы
+    # предупредить — на выходе получался повреждённый/рассинхронизированный
+    # файл, который выглядел как обычный успешный результат (см. отчёт,
+    # находки #3 и #20). Пока склейка не умеет честно обрабатывать частичный
+    # результат (сохранять индексы сегментов, вставлять явные пропуски),
+    # безопаснее полностью остановиться.
+    echo "[ERROR] Склейка отменена: без всех сегментов результат будет " &
+         "повреждён/рассинхронизирован. Запустите заново или используйте " &
+         "--keep-temp, чтобы разобрать причину сбоя вручную."
+    quit(1)
 
   echo ""
   echo "[CONCAT] Начинаем склейку..."
@@ -451,7 +559,8 @@ proc main() =
   echo repeat("═", 64)
   echo fmt"  Выходной файл:  {cfg.outputFile}  ({outSize} МБ)"
   echo fmt"  Общее время:    {fmtTime(totalWall)}"
-  echo fmt"  Ускорение:      ×{vi.duration / max(1.0, totalWall):.2f} к реальному"
+  if not unknownDuration:
+    echo fmt"  Ускорение:      ×{vi.duration / max(1.0, totalWall):.2f} к реальному"
   echo fmt"  Кадров вход:    {inFrames}"
   echo fmt"  Кадров выход:   {outFrames}"
   if inFrames > 0:

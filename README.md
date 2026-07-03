@@ -10,9 +10,9 @@
 
 ---
 
-## Быстрая сборка (v4)
+## Быстрая сборка (v1.2)
 
-Начиная с v4 в проекте есть `config.nims` — NimScript-файл, который Nim
+Начиная с v1.2 в проекте есть `config.nims` — NimScript-файл, который Nim
 компилятор выполняет автоматически перед сборкой. Он сам клонирует и
 собирает статический FFmpeg, если его ещё нет. Поэтому достаточно:
 
@@ -68,7 +68,7 @@ make build
     ├── ffmpeg_build/        ← создаётся при сборке (config.nims или make build-ffmpeg)
     │   ├── include/
     │   └── lib/  *.a
-    └── PMI                  ← готовый бинарный файл (результат сборки)
+    └── PMI                  ← готовый бинарь (результат сборки)
 ```
 
 `PMI.nim` подключает соседние модули как `import src/[ffmpeg_api, worker, concat]`;
@@ -90,7 +90,7 @@ make check-deps
 # Шаг 1: статические .a библиотеки FFmpeg (~10-15 мин)
 make build-ffmpeg
 
-# Шаг 2: бинарный файл PMI
+# Шаг 2: бинарь PMI
 make build
 ```
 
@@ -133,118 +133,6 @@ make build-ffmpeg FFMPEG_SRC=/другой/путь/к/FFmpeg
 
 ---
 
-## Кросс-компиляция под Windows (mingw-w64)
-
-Собранные под Linux `.a` в `ffmpeg_build/` (ELF) для бинарного файла Windows не годятся — FFmpeg и x264 нужно пересобрать отдельно под mingw-w64, а затем кросс-скомпилировать `PMI.nim` под `--os:windows`. `config.nims` сейчас собирает FFmpeg только под хост-платформу, поэтому для Windows-сборки используется отдельная папка `ffmpeg_build_win/` и ручные шаги ниже.
-
-### 1. Тулчейн на Fedora
-
-```bash
-sudo dnf install -y mingw64-gcc mingw64-gcc-c++ mingw64-binutils \
-                     mingw64-winpthreads-static mingw64-zlib-static \
-                     mingw64-bzip2-static mingw64-headers \
-                     mingw64-pkg-config nasm yasm git make
-```
-
-### 2. Кросс-сборка x264
-
-```bash
-git clone https://code.videolan.org/videolan/x264.git ../x264-mingw
-cd ../x264-mingw
-
-./configure \
-  --host=x86_64-w64-mingw32 \
-  --cross-prefix=x86_64-w64-mingw32- \
-  --enable-static --disable-cli --disable-opencl \
-  --prefix="$(pwd)/../PMI/ffmpeg_build_win"
-
-make -j$(nproc)
-make install
-cd ../PMI
-```
-
-### 3. Кросс-сборка FFmpeg
-
-Та же ветка (`release/7.1`), тот же набор `--enable-*`, что в `Makefile`/
-`config.nims`, но **без `-march=native`** (это опция под хост-CPU, при
-кросс-сборке она бессмысленна/ломает сборку) и с явным кросс-тулчейном:
-
-```bash
-cd ../FFmpeg
-
-BUILD_WIN=$(pwd)/../PMI/ffmpeg_build_win
-export PKG_CONFIG_LIBDIR="$BUILD_WIN/lib/pkgconfig"
-
-./configure \
-  --prefix="$BUILD_WIN" \
-  --arch=x86_64 --target-os=mingw32 \
-  --cross-prefix=x86_64-w64-mingw32- \
-  --enable-cross-compile \
-  --pkg-config=pkg-config --pkg-config-flags="--static" \
-  --enable-static --disable-shared \
-  --enable-gpl --enable-version3 --enable-libx264 \
-  --disable-programs --disable-doc --disable-debug --disable-autodetect \
-  --enable-protocol=file \
-  --enable-demuxer=matroska,mov,mpegts,avi,flv,concat \
-  --enable-muxer=matroska,mp4,mov,avi,segment \
-  --enable-decoder=h264,hevc,mpeg4,mpeg2video,vp9,vp8,av1,aac,ac3,mp3,eac3,dts,opus,vorbis,flac,truehd,ass,ssa,srt,subrip,dvd_subtitle,hdmv_pgs_subtitle \
-  --enable-encoder=libx264 \
-  --enable-parser=h264,hevc,aac,ac3,mpegaudio,vp9,av1,mpeg4video \
-  --enable-filter=minterpolate,buffer,buffersink,scale,format,fps,setpts,fifo \
-  --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,aac_adtstoasc,extract_extradata \
-  --extra-cflags="-O3 -static" \
-  --extra-ldflags="-static -static-libgcc"
-
-make -j$(nproc)
-make install
-```
-
-### 4. Кросс-компиляция PMI.nim
-
-```bash
-LIB=ffmpeg_build_win/lib
-INC=ffmpeg_build_win/include
-
-nim c -d:release --opt:speed --threads:on --mm:orc \
-  --os:windows --cpu:amd64 \
-  --gcc.exe:x86_64-w64-mingw32-gcc \
-  --gcc.linkerexe:x86_64-w64-mingw32-gcc \
-  --passC:"-I$INC" \
-  --passL:"-Wl,--start-group" \
-  --passL:"$LIB/libavfilter.a" \
-  --passL:"$LIB/libavcodec.a" \
-  --passL:"$LIB/libavformat.a" \
-  --passL:"$LIB/libswscale.a" \
-  --passL:"$LIB/libswresample.a" \
-  --passL:"$LIB/libavutil.a" \
-  --passL:"$LIB/libx264.a" \
-  --passL:"-Wl,--end-group" \
-  --passL:"-lz -lbz2 -lm" \
-  --passL:"-lws2_32 -lsecur32 -lbcrypt -lole32 -lstrmiids -lksuser -lmfuuid -ldxva2 -levr" \
-  --passL:"-static -static-libgcc -static-libstdc++" \
-  -o:PMI.exe \
-  PMI.nim
-```
-
-Пояснения:
-
-- `--gcc.exe` / `--gcc.linkerexe` переключают Nim на `x86_64-w64-mingw32-gcc`
-  вместо системного `gcc` — это и есть собственно кросс-компиляция.
-- Группа `-Wl,--start-group … --end-group` нужна так же, как в Linux-сборке,
-  из-за циклических зависимостей между `.a`.
-- Дополнительные `-l...` (`ws2_32`, `secur32`, `bcrypt`, `ole32`,
-  `strmiids`, `ksuser`, `mfuuid`, `dxva2`, `evr`) — системные Windows-библиотеки,
-  которые требует FFmpeg на mingw (сеть, крипто, DirectShow/Media Foundation
-  линкуются безусловно даже при `--disable-programs`). Если линковщик
-  пожалуется на неразрешённые символы — добавляйте недостающую библиотеку
-  по имени функции из ошибки (`undefined reference to ...@...`).
-
-> **Важно:** пока `config.nims` не умеет собирать под mingw сам, поэтому при
-> кросс-сборке его лучше временно отключать/игнорировать и использовать
-> команду из шага 4 напрямую, указывая на `ffmpeg_build_win/`.
-
----
-
 ## Стиль кода (v4)
 
 Во всех `.nim`-файлах проекта выдержаны единые соглашения:
@@ -278,25 +166,19 @@ nim c -d:release --opt:speed --threads:on --mm:orc \
 источник не YUV420P (10-bit HEVC, VP9, AV1). Без этого x264 падал с
 `AVERROR_EINVAL` при открытии кодека.
 
-**PTS из buffersink** — вместо ручного счётчика `ptsCounter` используется
-`filtFrame.pts` из буфера фильтра, конвертируемый в `time_base` энкодера.
-Это устраняет рассинхронизацию аудио/видео при mci-интерполяции.
+**PTS выходных кадров** — `writeFilteredFrame` использует строго монотонный
+счётчик `ptsCounter` (не сырой `filtFrame.pts` из буфера фильтра): у
+`minterpolate` на старте возможны дробные/дублирующиеся значения PTS,
+которые ломали бы монотонность потока при прямой передаче в энкодер.
+`decFrame.pts`, отправляемый в фильтрграф, при этом нормализуется из
+`best_effort_timestamp` декодера — это отдельный, более ранний этап
+конвейера (см. worker.nim: обработка `decFrame` перед `buffersrc`).
 
 **pixel_aspect** — SAR берётся из `decCtx.sample_aspect_ratio` (важно для
 анаморфного DVD/Blu-ray). В исходнике было захардкожено `1/1`.
 
 **av_strdup для имён FilterInOut** — FFmpeg ожидает heap-строки которые
 освобождает сам. В исходнике передавались стековые строковые литералы.
-
-**pict_type перед энкодером** — `filtFrame.pict_type`, унаследованный от
-исходного декодированного кадра (в источнике есть B-кадры), пробрасывался
-через фильтр-граф без изменений и попадал в `avcodec_send_frame`.
-libx264-обёртка трактует ненулевой `pict_type` как явное указание типа
-кадра, из-за чего на границах сегментов x264 ругался
-`specified frame type ... not compatible with keyframe interval`
-и сам принудительно менял тип. Перед кодированием `pict_type` теперь
-сбрасывается в `AV_PICTURE_TYPE_NONE`, чтобы x264 сам решал I/P/B по
-своей GOP-структуре.
 
 ### concat.nim
 
@@ -328,8 +210,112 @@ ATTACHMENT и прочие типы пропускаются (в исходни�
 
 - Убрано обращение к несуществующему `vi.targetFps`
 - `concatSegments` вызывается без `encCtxRef`
-- `MIN_SEG_DURATION = 2.0` с (minterpolate нужен контекст кадров)
-- Склейка продолжается при частичных ошибках сегментов
+- `MIN_SEG_DURATION = 4.0` с (minterpolate нужен контекст кадров)
+- ~~Склейка продолжается при частичных ошибках сегментов~~ — начиная с v5
+  это поведение признано небезопасным и заменено на полный отказ
+  (см. ниже, находка #3).
+
+---
+
+## v5 — исправления по статическому аудиту (report.md)
+
+Отдельный статический аудит кода (без сборки/запуска) выявил ряд проблем;
+все находки с номерами ниже соответствуют нумерации в `report.md`. Что
+исправлено в этой версии:
+
+**Critical**
+- **#1** `--temp-dir` больше не удаляет произвольный существующий каталог:
+  PMI удаляет temp-dir на выходе только если сам его создал в этом запуске
+  (`--keep-temp` теперь не нужен для защиты уже существующих каталогов —
+  они не трогаются в принципе).
+- **#2** Жёсткая проверка `input == output` (по абсолютным путям) перед
+  началом работы — раньше вывод мог затереть исходный файл.
+
+**High**
+- **#3** При падении хотя бы одного сегмента PMI больше не молча склеивает
+  оставшиеся — весь прогон останавливается с понятной ошибкой (частичная
+  склейка без учёта индексов/пропусков давала повреждённый/рассинхронный
+  файл, неотличимый от успешного).
+- **#4** `workerThread` теперь ловит любое `CatchableError`, а не только
+  `IOError`, и всегда шлёт результат в `resultChan` — раньше необработанное
+  исключение в воркере вешало главный поток в `recv` навсегда.
+- **#5** `decFrame.pts` явно нормализуется из `best_effort_timestamp` перед
+  отправкой в `buffersrc` — раньше это значение использовалось только для
+  проверки границ сегмента, а сам кадр мог уйти в фильтр с исходным/NOPTS
+  PTS, что ломало тайминг `minterpolate` на источниках с разреженными PTS.
+- **#6** Убран небезопасный ранний обрыв чтения по `pkt.pts` (PTS пакета не
+  монотонен при переупорядочивании B-кадров) — граница сегмента теперь
+  определяется исключительно по PTS уже декодированного кадра.
+- **#7** Ошибки `av_interleaved_write_frame` для аудио/субтитров больше не
+  проглатываются — видимы через `ffCheckWarn`, как и в видеопути.
+- **#8** Требует `docs/USAGE.md`, отсутствующего в этом срезе репозитория —
+  не исправлено, см. раздел «Не покрыто этим срезом» ниже.
+
+**Medium-High**
+- **#9** CLI-парсинг: опции вида `-j 4`, `--fps 60`, `--crf 20` и т.д.
+  (значение через пробел) теперь читаются так же надёжно, как `-i`/`-o` —
+  раньше они молча оставались со значением по умолчанию, а следующий
+  токен мог ошибочно уйти в позиционные аргументы.
+- **#10** Цветовые метаданные (`colorspace`/`range`) берутся из
+  `stream.codecpar` контейнера, если он их сообщает, и только при их
+  отсутствии используется дефолт BT.709/tv — раньше BT.709/tv
+  проставлялся всегда, независимо от реального источника (BT.601, HDR,
+  full-range и т.д.).
+
+**Medium**
+- **#12** Отсутствие `fmtCtx.duration` (типично для TS/broadcast) больше
+  не приводит к жёсткому отказу "видео слишком короткое": добавлены
+  запасные источники длительности (`stream.duration`, оценка по
+  `nb_frames`/fps), а если длительность всё равно неизвестна —
+  сегментация отключается (файл идёт одним потоком) вместо ошибки.
+- **#13** Добавлена валидация `--fps`, `--crf`, `--vsbmc`, `--mi-mode`,
+  `--mc-mode`, `--me-mode`, `--preset` и верхняя граница `--jobs` (64) —
+  раньше некорректные значения падали поздно, внутри FFmpeg/x264, а
+  `--jobs` не имел разумного предела.
+- **#14** `config.nims`: убрана жёсткая привязка к `nproc` (портируемое
+  определение числа ядер с фолбэком на `sysctl` для macOS/BSD), команда
+  `sudo dnf` больше не выполняется вслепую, если `dnf` не найден (не
+  Fedora/RHEL — печатается инструкция вместо попытки), пути и имя ветки в
+  shell-командах теперь в кавычках.
+- **#17** Метаданные потоков (язык, title) и disposition (default/forced)
+  теперь копируются в `concat.nim` вместе с параметрами кодека — раньше
+  терялись.
+
+**Low-Medium**
+- **#18** Устаревшие места в README приведены в соответствие с кодом:
+  описание PTS (реально используется монотонный счётчик, а не
+  `filtFrame.pts` из buffersink) и `MIN_SEG_DURATION` (было 2.0 в тексте,
+  4.0 в коде). Про `Makefile.windows` и структуру `docs/` — не
+  исправлено, эти файлы в этом срезе репозитория отсутствуют.
+- **#20** Естественно закрыто фиксом #3: раз частичный результат больше
+  не склеивается молча, счётчики кадров и прогресс больше не могут
+  выглядеть как «успешная полная конвертация» при повреждённом выводе.
+
+**Performance**
+- **#1** `writeFilteredFrame`/`drainFilter`/`flushEncoder` больше не
+  аллоцируют `AVPacket` на каждый кадр — один `tmpPkt` переиспользуется на
+  весь пайплайн сегмента (раньше — heap-аллокация/free на каждый из
+  60/120 кадров в секунду).
+
+### Не покрыто этим срезом репозитория
+
+Часть находок ссылается на файлы, которых нет среди загруженных
+(`docs/USAGE.md`, `docs/BUILD.md`, `LICENSE`, `.gitignore`,
+`Makefile.windows`, содержимое `ffmpeg_build/`) — без них исправить
+находки **#8** (fallback/предупреждение при MP4/MOV с несовместимыми
+потоками), **#15** (машинно-специфичные `.pc`-файлы, версия FFmpeg в
+`.gitignore`/вендоринге), **#16** (согласование MIT-лицензии проекта с
+GPL/x264 в статической линковке) и часть **#18** (ссылки на
+`Makefile.windows`) нельзя — нужны сами эти файлы.
+
+Также намеренно не тронуты архитектурные Performance-находки **#2–8**
+(overlap на коротких сегментах, статичное разбиение на сегменты без
+work-stealing, порядок записи аудио/видео в `concat.nim`, повторный
+`avformat_open_input`/probe на каждый сегмент/каждый temp-файл, верхняя
+граница `--jobs` уже добавлена в **#13**, но авто-подбор оптимального
+числа воркеров — нет) — каждая требует более широкого рефакторинга
+пайплайна, который рискованно делать вслепую без возможности
+скомпилировать и прогнать тесты в этой среде.
 
 ---
 

@@ -68,7 +68,8 @@ proc allLibsExist(dir: string): bool =
 # ------------------------------------------------------------------------------
 proc cloneFFmpeg(dst, branch: string) =
   echo fmt"[config.nims] Клонируем FFmpeg ({branch}) → {dst}"
-  exec fmt"git clone --branch {branch} --depth 1 https://github.com/FFmpeg/FFmpeg.git {dst}"
+  exec "git clone --branch \"" & branch & "\" --depth 1 " &
+       "https://github.com/FFmpeg/FFmpeg.git \"" & dst & "\""
 
 # ------------------------------------------------------------------------------
 # buildFFmpeg — configure + make + make install
@@ -78,21 +79,43 @@ proc cloneFFmpeg(dst, branch: string) =
 # декодеры популярных видео/аудио/субтитровых кодеков, x264-энкодер и
 # фильтры minterpolate/buffer/buffersink/format.
 # ------------------------------------------------------------------------------
+proc detectJobs(): string =
+  ## nproc — GNU/Linux-специфичная утилита; на macOS её обычно нет
+  ## (см. отчёт, находка #14 — "особенно вероятен сбой на macOS").
+  ## Пробуем nproc, затем sysctl (macOS/BSD), и только потом дефолт "4".
+  let nproc = gorgeEx("nproc")
+  if nproc.exitCode == 0 and strip(nproc.output) != "":
+    return strip(nproc.output)
+  let sysctl = gorgeEx("sysctl -n hw.ncpu")
+  if sysctl.exitCode == 0 and strip(sysctl.output) != "":
+    return strip(sysctl.output)
+  echo "[config.nims] [WARN] Не удалось определить число ядер, используем 4."
+  return "4"
+
 proc buildFFmpeg(src, prefix: string) =
-  let jobs = strip(gorge("nproc"))
+  let jobs = detectJobs()
 
   echo "[config.nims] Проверяем системные зависимости (dnf)..."
-  # "|| true" — не прерывать сборку, если пакеты уже установлены
-  # или dnf недоступен (например, сборка идёт не на Fedora).
-  exec "sudo dnf install -y nasm yasm gcc gcc-c++ make pkg-config " &
-       "x264-devel zlib-devel bzip2-devel xz-devel || true"
+  if findExe("dnf") == "":
+    echo "[config.nims] [WARN] dnf не найден (не Fedora/RHEL?) — пропускаем " &
+         "автоустановку системных пакетов. Если сборка ./configure упадёт " &
+         "на отсутствующих заголовках, поставьте nasm/yasm/x264-devel/" &
+         "zlib-devel/bzip2-devel/xz-devel вручную через пакетный менеджер " &
+         "вашей ОС (см. README) и повторите запуск."
+  else:
+    # "|| true" — не прерывать сборку, если пакеты уже установлены.
+    exec "sudo dnf install -y nasm yasm gcc gcc-c++ make pkg-config " &
+         "x264-devel zlib-devel bzip2-devel xz-devel || true"
 
   let configureFlags = [
-    fmt"--prefix={prefix}",
+    "--prefix=\"" & prefix & "\"",
     "--enable-static", "--disable-shared", "--enable-pic",
     "--enable-gpl", "--enable-version3", "--enable-libx264",
     "--disable-programs", "--disable-doc", "--disable-debug",
     "--disable-autodetect",
+    "--disable-postproc",   # легаси MPlayer pp-фильтр PMI не использует;
+                             # без этого флага vf_pp.o всё равно попадает
+                             # в libavfilter.a и тянет символы из libpostproc
     "--enable-protocol=file",
     "--enable-demuxer=matroska,mov,mpegts,avi,flv,concat",
     "--enable-muxer=matroska,mp4,mov,avi,segment",
@@ -153,6 +176,16 @@ switch("passC", fmt"-I{incDir}")
 switch("passL", "-Wl,--start-group")
 for libName in ffmpegLibs:
   switch("passL", libDir / libName)
+# libavfilter.a содержит vf_pp.o (легаси MPlayer-фильтр "pp") со ссылками
+# на pp_postprocess/pp_get_context/... — это символы из ОТДЕЛЬНОЙ статической
+# библиотеки libpostproc.a, которую FFmpeg собирает по умолчанию (postproc
+# не отключён явно в configureFlags), но которая раньше не попадала в
+# --passL. PMI этот фильтр не использует, но libavfilter тянет его
+# безусловно, поэтому символы нужно разрешить линковкой, а не удалением
+# кода. Линкуем, только если файл реально собран — на случай, если в
+# будущей пересборке появится --disable-postproc (см. ниже).
+if fileExists(libDir / "libpostproc.a"):
+  switch("passL", libDir / "libpostproc.a")
 switch("passL", "-Wl,--end-group")
 
 switch("passL", "-lx264")

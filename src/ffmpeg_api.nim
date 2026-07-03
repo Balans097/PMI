@@ -69,6 +69,12 @@ const
   # а не наследовал тип от исходного (уже интерпретированного) кадра.
   AV_PICTURE_TYPE_NONE* = cint(0)
 
+  # "Не размечено" для цветовых полей codecpar/decCtx/frame — используется
+  # для решения, есть ли у контейнера реальные color_space/color_range,
+  # или нужно падать на дефолт BT.709/tv.
+  AVCOL_SPC_UNSPECIFIED*   = cint(2)
+  AVCOL_RANGE_UNSPECIFIED* = cint(0)
+
   AV_NOPTS_VALUE* = cast[int64](0x8000000000000000'u64)
   AV_TIME_BASE*   = 1_000_000
 

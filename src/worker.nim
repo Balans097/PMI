@@ -123,15 +123,19 @@ proc buildFilterGraph(p: var Pipeline;
     # decCtx.colorspace/color_range почти всегда "unspecified" — реальные
     # значения появляются только в decFrame.colorspace/color_range уже
     # ПОСЛЕ декодирования первого кадра (парсятся из VUI/SEI H.264).
-    # Поэтому здесь мы не читаем decCtx — сразу берём дефолт bt709/tv
-    # (типично для web-рипов без явной цветовой разметки) и далее
-    # ПРИНУДИТЕЛЬНО проставляем это же значение в каждый decFrame перед
-    # отправкой в buffersrc (см. вызовы av_buffersrc_add_frame_flags) —
-    # это убирает предупреждение "Changing video frame properties on
-    # the fly is not supported by all filters" и гарантирует, что
-    # выходной файл получит согласованную цветовую метку.
-    cspInt   = 1.cint  # AVCOL_SPC_BT709
-    rangeInt = 1.cint  # AVCOL_RANGE_MPEG (tv)
+    #
+    # Но `stream.codecpar` (AVCodecParameters) заполняется демуксером из
+    # контейнера/SPS ДО открытия декодера и часто уже содержит корректные
+    # color_space/color_range/primaries/trc — используем их как основной
+    # источник. Раньше здесь всегда жёстко стояло bt709/tv, что молча
+    # переразмечало SD BT.601, full-range, HDR/BT.2020 и другие
+    # non-BT.709 источники в BT.709 (см. отчёт, находка #10). BT.709/tv
+    # остаётся дефолтом только когда codecpar сам ничего не знает
+    # (typично для web-рипов без явной цветовой разметки).
+    csp   = stream.codecpar.color_space
+    rng   = stream.codecpar.color_range
+    cspInt   = if csp.cint != AVCOL_SPC_UNSPECIFIED: csp.cint else: 1.cint    # 1 = BT709
+    rangeInt = if rng.cint != AVCOL_RANGE_UNSPECIFIED: rng.cint else: 1.cint  # 1 = MPEG (tv)
 
   p.outCsp   = AVColorSpace(cspInt)
   p.outRange = AVColorRange(rangeInt)
@@ -209,14 +213,17 @@ proc freeFilterGraph(fg: var FilterGraph) =
 # ------------------------------------------------------------------------------
 proc writeFilteredFrame(p: var Pipeline;
                         filtFrame:     ptr AVFrame;
+                        tmpPkt:        ptr AVPacket;
                         outFrameCount: var int64;
                         ptsCounter:    var int64) =
   ## Конвертирует PTS и кодирует один filtFrame.
   ## ptsCounter — строгий монотонный счётчик в единицах time_base энкодера.
-  let
-    outStream = p.outFmt.streams[p.outVidIdx]
-    tmpPkt    = av_packet_alloc()
-  defer: av_packet_free(addr tmpPkt)
+  ## tmpPkt переиспользуется вызывающей стороной (см. processSegment) —
+  ## раньше `av_packet_alloc()`/`av_packet_free()` вызывались на каждый
+  ## кадр, что на 60/120 fps выходе даёт аллокацию в куче на каждый кадр
+  ## (Performance Findings #1). Теперь пакет живёт на весь пайплайн
+  ## сегмента, здесь только `av_packet_unref`.
+  let outStream = p.outFmt.streams[p.outVidIdx]
 
   # Используем строго монотонный счётчик (не PTS из filtFrame —
   # minterpolate может выдавать дробные/дублирующиеся значения на старте)
@@ -225,8 +232,8 @@ proc writeFilteredFrame(p: var Pipeline;
   inc outFrameCount
 
   # frame.pict_type наследуется от исходного декодированного кадра
-  # (в источнике есть B-кадры) и пробрасывается фильтром как есть.
-  # Если не сбросить его, libx264-обёртка трактует это как явное
+  # (в источнике есть B-кадры) и пробрасывается фильтром как есть. Если не
+  # сбросить его, libx264-обёртка трактует ненулевой pict_type как явное
   # указание типа кадра и на границе GOP/сегмента ругается
   # "specified frame type ... not compatible with keyframe interval",
   # принудительно меняя тип сама. Явно отдаём решение x264.
@@ -254,6 +261,7 @@ proc writeFilteredFrame(p: var Pipeline;
 # ------------------------------------------------------------------------------
 proc drainFilter(p:            var Pipeline;
                  filtFrame:    ptr AVFrame;
+                 tmpPkt:       ptr AVPacket;
                  outFrameCount: var int64;
                  ptsCounter:   var int64;
                  writeFromSec:  float;    # кадры с меньшим PTS не пишем
@@ -282,14 +290,12 @@ proc drainFilter(p:            var Pipeline;
       av_frame_unref(filtFrame)
       break
 
-    writeFilteredFrame(p, filtFrame, outFrameCount, ptsCounter)
+    writeFilteredFrame(p, filtFrame, tmpPkt, outFrameCount, ptsCounter)
     av_frame_unref(filtFrame)
 
-proc flushEncoder(p: var Pipeline; outFrameCount: var int64; ptsCounter: var int64) =
-  let
-    outStream = p.outFmt.streams[p.outVidIdx]
-    tmpPkt    = av_packet_alloc()
-  defer: av_packet_free(addr tmpPkt)
+proc flushEncoder(p: var Pipeline; tmpPkt: ptr AVPacket;
+                  outFrameCount: var int64; ptsCounter: var int64) =
+  let outStream = p.outFmt.streams[p.outVidIdx]
 
   let sr = avcodec_send_frame(p.encCtx, nil)
   if sr < 0 and sr != AVERROR_EOF:
@@ -429,12 +435,14 @@ proc processSegment*(job: SegmentJob): SegmentResult =
       pkt       = av_packet_alloc()
       decFrame  = av_frame_alloc()
       filtFrame = av_frame_alloc()
-    if pkt == nil or decFrame == nil or filtFrame == nil:
+      tmpPkt    = av_packet_alloc()   # переиспользуется всеми encode-вызовами сегмента
+    if pkt == nil or decFrame == nil or filtFrame == nil or tmpPkt == nil:
       raise newException(IOError, "av_alloc failed")
     defer:
       av_packet_free(addr pkt)
       av_frame_free(addr decFrame)
       av_frame_free(addr filtFrame)
+      av_packet_free(addr tmpPkt)
 
     var
       frameCount:    int64 = 0  # кадров декодировано
@@ -453,13 +461,13 @@ proc processSegment*(job: SegmentJob): SegmentResult =
         av_packet_unref(pkt)
         continue
 
-      # Проверяем не вышли ли за конец зоны чтения
-      if pkt.pts != AV_NOPTS_VALUE:
-        let pktSec = av_q2d(p.inTB) * pkt.pts.float
-        if pktSec > readEndSec + 0.5:
-          av_packet_unref(pkt)
-          done = true
-          break
+      # Раньше здесь была ранняя остановка чтения по pkt.pts > readEndSec:
+      # PTS ПАКЕТА (в отличие от PTS декодированного КАДРА) не гарантированно
+      # монотонен при переупорядочивании из-за B-кадров — считывая пакеты в
+      # порядке декодирования (DTS), можно наткнуться на пакет с "далёким"
+      # PTS ещё до того, как дочитаны все пакеты, чьи кадры на самом деле
+      # попадают в окно сегмента. Останов по времени сделан ниже — по
+      # best_effort_timestamp уже ДЕКОДИРОВАННОГО кадра (см. frameSec).
 
       let dr = avcodec_send_packet(p.decCtx, pkt)
       av_packet_unref(pkt)
@@ -485,6 +493,18 @@ proc processSegment*(job: SegmentJob): SegmentResult =
 
         inc frameCount
 
+        # best_effort_timestamp — единственный надёжный PTS декодированного
+        # кадра (учитывает переупорядочивание B-кадров и умеет достраивать
+        # значение из DTS, если PTS у потока отсутствует/разрежен). Раньше
+        # эта величина использовалась только для проверки границ сегмента
+        # выше, а сам decFrame.pts, отправляемый в buffersrc, не менялся —
+        # т.е. фильтр мог получать неверный/исходный (или NOPTS) PTS кадра.
+        # На источниках с пропущенными/нестандартными PTS это ломало
+        # тайминг интерполяции minterpolate. Проставляем нормализованное
+        # значение явно перед отправкой в фильтрграф.
+        if fts != AV_NOPTS_VALUE:
+          decFrame.pts = fts
+
         # Принудительно тегируем кадр тем же csp/range, что заявлен
         # buffersrc при создании фильтрграфа (p.outCsp/p.outRange) —
         # иначе libavfilter ругается "Changing video frame properties
@@ -501,7 +521,7 @@ proc processSegment*(job: SegmentJob): SegmentResult =
           continue
 
         # drainFilter пишет только кадры в [startTime, writeEndSec]
-        drainFilter(p, filtFrame, outFrameCount, ptsCounter,
+        drainFilter(p, filtFrame, tmpPkt, outFrameCount, ptsCounter,
                     job.startTime, writeEndSec)
 
     # ── 7. Flush: три фазы ───────────────────────────────────────────────
@@ -519,16 +539,16 @@ proc processSegment*(job: SegmentJob): SegmentResult =
           p.fg.srcCtx, decFrame, AV_BUFFERSRC_FLAG_KEEP_REF)
         av_frame_unref(decFrame)
         if fr >= 0:
-          drainFilter(p, filtFrame, outFrameCount, ptsCounter,
+          drainFilter(p, filtFrame, tmpPkt, outFrameCount, ptsCounter,
                       job.startTime, writeEndSec)
 
     # Фаза 2: flush фильтра
     discard av_buffersrc_add_frame_flags(p.fg.srcCtx, nil, 0)
-    drainFilter(p, filtFrame, outFrameCount, ptsCounter,
+    drainFilter(p, filtFrame, tmpPkt, outFrameCount, ptsCounter,
                 job.startTime, writeEndSec)
 
     # Фаза 3: flush энкодера
-    flushEncoder(p, outFrameCount, ptsCounter)
+    flushEncoder(p, tmpPkt, outFrameCount, ptsCounter)
 
     ffCheck(av_write_trailer(p.outFmt), "av_write_trailer")
 
@@ -541,7 +561,7 @@ proc processSegment*(job: SegmentJob): SegmentResult =
     echo fmt"[SEG {job.jobId:02d}] dec={frameCount} enc={outFrameCount}" &
          fmt" dur={result.durationSec:.3f}s → {extractFilename(job.outputFile)}"
 
-  except IOError as e:
+  except CatchableError as e:
     result.success  = false
     result.errorMsg = e.msg
     echo fmt"[ERROR] seg{job.jobId}: {e.msg}"
@@ -561,5 +581,19 @@ proc processSegment*(job: SegmentJob): SegmentResult =
 # Точка входа потока
 # ------------------------------------------------------------------------------
 proc workerThread*(job: SegmentJob) {.thread.} =
-  let res = processSegment(job)
-  send(resultChan, res)
+  # processSegment теперь сама ловит CatchableError (см. ниже) и всегда
+  # возвращает SegmentResult. Но send() и вообще код вокруг вызова —
+  # это код workerThread, а не processSegment: если бы здесь возникло
+  # необработанное исключение до send(resultChan, res), main() навсегда
+  # завис бы в recv, ожидая результат для этого jobId (полный deadlock
+  # главного потока вместо сообщения об ошибке). Ловим здесь всё как
+  # последний рубеж защиты.
+  try:
+    let res = processSegment(job)
+    send(resultChan, res)
+  except CatchableError as e:
+    send(resultChan, SegmentResult(
+      jobId:      job.jobId,
+      outputFile: job.outputFile,
+      success:    false,
+      errorMsg:   "необработанное исключение: " & e.msg))

@@ -5,8 +5,8 @@ includedir=/home/admin/Work/Nim/Projects/FrameInterpolation/PMI/ffmpeg_build/inc
 
 Name: libswresample
 Description: FFmpeg audio resampling library
-Version: 6.2.100
-Requires: libavutil >= 60.25.100
+Version: 5.3.100
+Requires: libavutil >= 59.39.100
 Requires.private: 
 Conflicts:
 Libs: -L${libdir}  -lswresample -lm -latomic

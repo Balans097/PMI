@@ -26,9 +26,17 @@ FFMPEG_LIBS := \
   $(LIB)/libswresample.a \
   $(LIB)/libavutil.a
 
+# libavfilter.a содержит легаси-фильтр vf_pp (символы pp_*), которые FFmpeg
+# по умолчанию выносит в ОТДЕЛЬНУЮ libpostproc.a. PMI фильтр "pp" не
+# использует, но линковщику всё равно нужно разрешить эти символы —
+# добавляем библиотеку в группу, только если она реально собрана
+# (см. build-ffmpeg: --disable-postproc делает её ненужной для новых сборок).
+POSTPROC_LIB := $(wildcard $(LIB)/libpostproc.a)
+
 FFMPEG_GROUP := \
   --passL:"-Wl,--start-group" \
   $(foreach lib,$(FFMPEG_LIBS),--passL:"$(lib)") \
+  $(if $(POSTPROC_LIB),--passL:"$(POSTPROC_LIB)") \
   --passL:"-Wl,--end-group"
 
 PASSL_FFMPEG := $(FFMPEG_GROUP)
@@ -116,6 +124,7 @@ build-ffmpeg:
 	  --disable-doc \
 	  --disable-debug \
 	  --disable-autodetect \
+	  --disable-postproc \
 	  --enable-protocol=file \
 	  --enable-demuxer=matroska \
 	  --enable-demuxer=mov \

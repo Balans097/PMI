@@ -118,6 +118,9 @@ proc concatSegments*(segFiles:    seq[string];
     "concat: parameters_copy video")
   outVidStream.codecpar.codec_tag = 0.cuint
   outVidStream.time_base = vidTB
+  discard av_dict_copy(addr outVidStream.metadata,
+                        srcFmtCtx.streams[videoIdx].metadata, 0.cint)
+  outVidStream.disposition = srcFmtCtx.streams[videoIdx].disposition
 
   # ── Аудио / субтитры из исходника ─────────────────────────────────────
   var maps: seq[StreamMap] = @[]
@@ -139,6 +142,12 @@ proc concatSegments*(segFiles:    seq[string];
             fmt"concat: parameters_copy stream {i}")
     outStream.codecpar.codec_tag = 0.cuint
     outStream.time_base = inStream.time_base
+    # Раньше копировались только параметры кодека — язык, title,
+    # default/forced-флаги и прочие метаданные потока терялись (см. отчёт,
+    # находка #17). av_dict_copy(..., 0) добавляет к уже имеющимся ключам;
+    # outStream.metadata на новом потоке nil, так что это просто копия.
+    discard av_dict_copy(addr outStream.metadata, inStream.metadata, 0.cint)
+    outStream.disposition = inStream.disposition
 
     add(maps, StreamMap(
       inIdx:  i.cint,
@@ -297,7 +306,8 @@ proc concatSegments*(segFiles:    seq[string];
               auxPkt.duration     = outDur
               auxPkt.pos          = -1
 
-              discard av_interleaved_write_frame(outFmt, auxPkt)
+              ffCheckWarn(av_interleaved_write_frame(outFmt, auxPkt),
+                          fmt"concat: aux write (stream {m.inIdx})")
               audioWritten = true
               hit = true
 
