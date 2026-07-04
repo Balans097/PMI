@@ -146,7 +146,7 @@ make build-ffmpeg FFMPEG_SRC=/другой/путь/к/FFmpeg
 
 Полная история изменений (v1.0 → v1.3), включая описание всех багфиксов
 пайплайна и находок статического аудита, вынесена в
-[CHANGELOG.md](./CHANGELOG.md).
+[CHANGELOG.md](./docs/CHANGELOG.md).
 
 ---
 
