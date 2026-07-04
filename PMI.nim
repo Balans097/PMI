@@ -367,8 +367,8 @@ PMI — Parallel Motion Interpolate  (v{PMI_VERSION})
   --temp-dir=DIR       Папка сегментов (default: .pmi_tmp_*)
   --keep-temp          Не удалять сегменты
   -v, --verbose        AV_LOG_INFO
-  -h, --help            Эта справка
-  -V, --version         Показать версию
+  -h, --help           Эта справка
+  -V, --version        Показать версию
 """
         quit(0)
       of "V", "version":
@@ -723,5 +723,10 @@ proc main() =
     echo fmt"  Мультипликатор: ×{outFrames.float / inFrames.float:.2f}"
   echo repeat("═", 64)
 
+
+
+
 when isMainModule:
   main()
+
+

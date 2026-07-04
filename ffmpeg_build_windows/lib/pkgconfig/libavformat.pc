@@ -1,0 +1,14 @@
+prefix=/home/admin/Work/Nim/Projects/FrameInterpolation/PMI/ffmpeg_build_windows
+exec_prefix=${prefix}
+libdir=/home/admin/Work/Nim/Projects/FrameInterpolation/PMI/ffmpeg_build_windows/lib
+includedir=/home/admin/Work/Nim/Projects/FrameInterpolation/PMI/ffmpeg_build_windows/include
+
+Name: libavformat
+Description: FFmpeg container format library
+Version: 61.7.103
+Requires: libavcodec >= 61.19.101, libswresample >= 5.3.100, libavutil >= 59.39.100
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lavformat -lm -latomic -lws2_32
+Libs.private: 
+Cflags: -I${includedir}

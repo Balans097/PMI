@@ -1,0 +1,14 @@
+prefix=/home/admin/Work/Nim/Projects/FrameInterpolation/PMI/ffmpeg_build_windows
+exec_prefix=${prefix}
+libdir=/home/admin/Work/Nim/Projects/FrameInterpolation/PMI/ffmpeg_build_windows/lib
+includedir=/home/admin/Work/Nim/Projects/FrameInterpolation/PMI/ffmpeg_build_windows/include
+
+Name: libavutil
+Description: FFmpeg utility library
+Version: 59.39.100
+Requires: 
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lavutil -lm -luser32 -lbcrypt -latomic
+Libs.private: 
+Cflags: -I${includedir}

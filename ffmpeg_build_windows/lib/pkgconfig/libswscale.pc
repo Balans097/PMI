@@ -1,0 +1,14 @@
+prefix=/home/admin/Work/Nim/Projects/FrameInterpolation/PMI/ffmpeg_build_windows
+exec_prefix=${prefix}
+libdir=/home/admin/Work/Nim/Projects/FrameInterpolation/PMI/ffmpeg_build_windows/lib
+includedir=/home/admin/Work/Nim/Projects/FrameInterpolation/PMI/ffmpeg_build_windows/include
+
+Name: libswscale
+Description: FFmpeg image rescaling library
+Version: 8.3.100
+Requires: libavutil >= 59.39.100
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lswscale -lm -latomic
+Libs.private: 
+Cflags: -I${includedir}
