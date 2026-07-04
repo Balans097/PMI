@@ -2,6 +2,8 @@
 
 Подробное руководство по компиляции всех зависимостей (libx264, FFmpeg) и самого приложения PMI на **Linux** и **Windows**.
 
+Актуальная версия проекта: **v1.3**.
+
 ---
 
 ## Содержание
@@ -55,9 +57,11 @@ PMI ожидает следующую структуру по умолчанию
 ├── x264/                       ← исходники libx264 (если собирать вручную)
 └── PMI/                        ← исходники PMI
     ├── PMI.nim
-    ├── worker.nim
-    ├── concat.nim
-    ├── ffmpeg_api.nim
+    ├── config.nims
+    ├── src/
+    │   ├── worker.nim
+    │   ├── concat.nim
+    │   └── ffmpeg_api.nim
     ├── Makefile
     ├── Makefile.windows
     └── ffmpeg_build/           ← создаётся при make build-ffmpeg

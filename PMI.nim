@@ -1,5 +1,5 @@
 # ==============================================================================
-#  PMI.nim  — Parallel Motion Interpolate  (v1.2)
+#  PMI.nim  — Parallel Motion Interpolate  (v1.3)
 #
 #  ТОЧКА ВХОДА ПРИЛОЖЕНИЯ. Здесь происходит:
 #   1. Разбор аргументов командной строки (parseArgs).
@@ -11,7 +11,15 @@
 #      получение результатов через Channel.
 #   5. Склейка успешных сегментов в один файл (concat.concatSegments).
 #
-#  ИЗМЕНЕНИЯ v1.2 (относительно v1.1, см. README):
+#  ИЗМЕНЕНИЯ v1.3 (относительно v1.2, см. README):
+#   • Добавлена константа PMI_VERSION и флаг -V/--version; версия печатается
+#     также в баннере запуска и в тексте --help.
+#   • Убран неиспользуемый import std/math (клампы приходят из system).
+#   • См. README/CHANGELOG: два критических фикса компиляции в src/worker.nim
+#     и src/concat.nim (let → var для указателей, которые освобождаются
+#     через addr) — без них проект вообще не собирался.
+#
+#  ИЗМЕНЕНИЯ v4 (относительно v3, см. README):
 #   • Стилевая правка исходного кода: везде префиксный синтаксис вызова
 #     функций (len(A) вместо A.len и т.п.), однострочные/блочные
 #     объявления const/let/var, сгруппированные import.
@@ -23,9 +31,29 @@
 
 {.experimental: "parallel".}
 
-import std/[strformat, strutils, parseopt, os, math,
-            times, monotimes, sequtils, algorithm]
+import std/[strformat, strutils, parseopt, os,
+            times, monotimes, sequtils, algorithm, terminal]
 import src/[ffmpeg_api, worker, concat]
+
+const PMI_VERSION* = "1.3"
+
+# ------------------------------------------------------------------------------
+# Определение TTY — цветной прогресс-бар с перерисовкой на месте (курсор
+# вверх + перезапись строк) имеет смысл только в интерактивном терминале.
+# Если stdout перенаправлен в файл/лог, ANSI-коды перемещения курсора там
+# бессмысленны и только испортят лог — в этом случае используется старый
+# построчный вывод [DONE]/[FAIL] без перерисовки.
+#
+# std/terminal не даёт единого кроссплатформенного isatty без оговорок,
+# поэтому используем прямой FFI к C-библиотеке (portable: unistd.h на
+# POSIX, io.h на Windows/mingw — актуально и для кросс-сборки под Windows,
+# см. README).
+when defined(windows):
+  proc isattyImpl(fd: cint): cint {.importc: "_isatty", header: "<io.h>".}
+else:
+  proc isattyImpl(fd: cint): cint {.importc: "isatty", header: "<unistd.h>".}
+
+let stdoutIsTty = isattyImpl(1.cint) != 0   # fd 1 = stdout
 
 # ------------------------------------------------------------------------------
 # Конфигурация приложения — заполняется из аргументов командной строки
@@ -188,6 +216,42 @@ proc bar(done, total: int; width = 40): string =
   let f = if total > 0: (done * width) div total else: 0
   "[" & repeat("█", f) & repeat("░", width - f) & "]"
 
+proc renderSegLine(jobId: int; curFrames, totalFrames: int64;
+                   state: string;  # "run" | "done" | "fail"
+                   errMsg: string; width = 28): string =
+  ## Одна строка живого прогресса сегмента: цветной бар + % + кадры.
+  ## state="run"  → голубой, ещё считает
+  ## state="done" → зелёный, ✓
+  ## state="fail" → красный, ✗ + текст ошибки
+  let
+    # segTotalFrames — это оценка ДО запуска (длительность×fps×множитель),
+    # а curFrames для завершённого сегмента — реальное число кадров на
+    # выходе энкодера. Небольшое расхождение (округление minterpolate,
+    # обрезка на границе overlap) — это норма, а не ошибка обработки.
+    # Без этой развязки успешно завершённый сегмент мог навсегда
+    # показывать "99.9%" и недорисованный бар, хотя файл полностью готов.
+    pct = if state == "done": 100.0
+          elif totalFrames > 0: clamp(curFrames.float / totalFrames.float * 100.0, 0.0, 100.0)
+          else: 0.0
+    filled = if state == "done": width
+             else: clamp(int(pct / 100.0 * width.float), 0, width)
+    barStr = "[" & repeat("█", filled) & repeat("░", width - filled) & "]"
+    color  = case state
+             of "done": fgGreen
+             of "fail": fgRed
+             else:      fgCyan
+    mark   = case state
+             of "done": "✓"
+             of "fail": "✗"
+             else:      "…"
+    code   = ansiForegroundColorCode(color, bright = true)
+
+  result = fmt"{code}Сег.{jobId:02d} {mark} {barStr}{ansiResetCode}" &
+           fmt" {pct:5.1f}%  {curFrames:>6}/{totalFrames:<6} кадров"
+  if state == "fail":
+    let e = if len(errMsg) > 60: errMsg[0..<60] & "…" else: errMsg
+    result &= fmt"{ansiForegroundColorCode(fgRed)}  — {e}{ansiResetCode}"
+
 proc fmtTime(sec: float): string =
   ## Форматирует секунды в ЧЧ:ММ:СС.
   let s = max(0, sec.int)
@@ -195,7 +259,7 @@ proc fmtTime(sec: float): string =
 
 proc printBanner(cfg: PMIConfig; vi: VideoInfo; nw: int; durationUnknown: bool) =
   echo repeat("═", 64)
-  echo "  PMI — Parallel Motion Interpolate"
+  echo fmt"  PMI — Parallel Motion Interpolate  (v{PMI_VERSION})"
   echo repeat("═", 64)
   echo fmt"  Вход:        {cfg.inputFile}"
   echo fmt"  Выход:       {cfg.outputFile}"
@@ -276,8 +340,8 @@ proc parseArgs(): PMIConfig =
       of "keep-temp":    result.keepTemp  = true
       of "v", "verbose": result.verbose   = true
       of "h", "help":
-        echo """
-PMI — Parallel Motion Interpolate
+        echo fmt"""
+PMI — Parallel Motion Interpolate  (v{PMI_VERSION})
 Повышение FPS через minterpolate + x264, параллельно по N ядрам.
 
   PMI [опции] [входной файл]
@@ -304,7 +368,11 @@ PMI — Parallel Motion Interpolate
   --keep-temp          Не удалять сегменты
   -v, --verbose        AV_LOG_INFO
   -h, --help            Эта справка
+  -V, --version         Показать версию
 """
+        quit(0)
+      of "V", "version":
+        echo fmt"PMI (Parallel Motion Interpolate) v{PMI_VERSION}"
         quit(0)
       else:
         echo fmt"[WARN] Неизвестная опция: --{p.key}"
@@ -366,7 +434,33 @@ proc main() =
     echo fmt"[ERROR] Неверный --jobs={cfg.numWorkers} (допустимо 1..{MAX_JOBS}, 0=авто)"
     quit(1)
 
-  av_log_set_level(if cfg.verbose: AV_LOG_INFO else: AV_LOG_WARNING)
+  # libav сам пишет свои сообщения прямо в stderr, в обход построчной
+  # перерисовки прогресс-бара: redraw() (см. ниже) умеет поднимать курсор
+  # ТОЛЬКО на то число строк, которое сама PMI напечатала через echo
+  # (cursorUp(stdout, actualSegs)). Любая WARNING-строка от libav — типично
+  # "Could not find codec parameters for stream N (Attachment: none)" при
+  # открытии контейнера каждым из воркеров (безобидно, см. отчёт находка
+  # #6) — физически появляется в терминале между перерисовками и сдвигает
+  # весь последующий вывод на одну строку вниз. PMI об этом сдвиге не
+  # знает, поэтому следующий cursorUp() поднимается уже не туда — бар
+  # необратимо "съезжает" вниз на каждое такое предупреждение (именно это
+  # наблюдалось на практике, см. скриншот в обсуждении).
+  #
+  # В live-TTY режиме поэтому глушим WARNING полностью — ERROR всё равно
+  # почти всегда приводит к немедленному исключению через ffCheck и
+  # остановке процесса, так что проглатывать WARNING здесь не опасно.
+  # Вне TTY (вывод в файл/pipe) перерисовки нет — сдвигать нечего, там
+  # поведение прежнее.
+  av_log_set_level(
+    if stdoutIsTty: AV_LOG_ERROR
+    elif cfg.verbose: AV_LOG_INFO
+    else: AV_LOG_WARNING)
+
+  if cfg.verbose and stdoutIsTty:
+    echo "[INFO] --verbose с live-прогрессом в терминале не совместим " &
+         "(WARNING-строки libav ломают перерисовку бара выше) — " &
+         "подробный лог libav отключён на время этого запуска. Для " &
+         "полного лога перенаправьте вывод в файл: PMI ... > pmi.log 2>&1"
 
   let
     cpuCount   = av_cpu_count().int
@@ -443,6 +537,16 @@ proc main() =
   var threads = newSeq[Thread[SegmentJob]](actualSegs)
   let wallStart = getMonoTime()
 
+  # Ожидаемое число выходных кадров на сегмент (для % и живого бара) —
+  # оценка по cleanDurSec*targetFps; фактическое outFrameCount может чуть
+  # отличаться (округления PTS у minterpolate), поэтому бар допускает
+  # переполнение за 100% и просто зажимается clamp'ом в renderSegLine.
+  let segTotalFrames = mapIt(segments,
+    max(1'i64, int64(it.cleanDurSec * cfg.targetFps.float + 0.5)))
+
+  worker.initProgress(actualSegs)
+  defer: worker.freeProgress()
+
   for i, seg in segments:
     let job = SegmentJob(
       jobId:         i,
@@ -469,30 +573,82 @@ proc main() =
 
   var
     results   = newSeq[SegmentResult](actualSegs)
+    doneMask  = newSeq[bool](actualSegs)
     doneCount = 0
     errors:   seq[string] = @[]
 
-  while doneCount < actualSegs:
-    let res = recv(resultChan)
-    results[res.jobId] = res
-    inc doneCount
+  if stdoutIsTty:
+    # ── Живой цветной прогресс: перерисовка actualSegs строк в терминале ──
+    var states  = newSeq[string](actualSegs)
+    for i in 0..<actualSegs: states[i] = "run"
 
-    let
-      elapsed = inSeconds(getMonoTime() - wallStart).float
-      eta = if doneCount < actualSegs:
-        elapsed / doneCount.float * (actualSegs - doneCount).float
-      else: 0.0
+    proc redraw(firstDraw: bool) =
+      if not firstDraw: cursorUp(stdout, actualSegs)
+      for i in 0..<actualSegs:
+        # Явный \r перед eraseLine: cursorUp() двигает курсор только ВВЕРХ,
+        # колонку не трогает. Если предыдущая печать оставила курсор не в
+        # колонке 0 (например, из-за терминала/PTY, где перевод строки не
+        # гарантированно возвращает каретку в начало), erase+echo пишут
+        # поверх старой строки со сдвигом, а не заменяют её — визуально это
+        # выглядит как "размножение" строки прогресса вместо перерисовки на
+        # месте (наблюдалось на практике). \r убирает эту зависимость от
+        # поведения терминала.
+        stdout.write("\r")
+        eraseLine(stdout)
+        let cur = if doneMask[i]: results[i].outFrameCount
+                  else: worker.getProgress(i)
+        let err = if doneMask[i] and not results[i].success: results[i].errorMsg
+                  else: ""
+        echo renderSegLine(i, cur, segTotalFrames[i], states[i], err)
 
-    if res.success:
-      let sz = if fileExists(res.outputFile):
-        getFileSize(res.outputFile) div (1024*1024) else: 0i64
-      echo fmt"[DONE {doneCount:2d}/{actualSegs}] Сег.{res.jobId:02d}" &
-           fmt" | dec={res.frameCount} enc={res.outFrameCount}" &
-           fmt" dur={res.durationSec:.2f}s" &
-           fmt" | {sz} МБ | ETA {fmtTime(eta)}  {bar(doneCount, actualSegs)}"
-    else:
-      echo fmt"[FAIL  {doneCount:2d}/{actualSegs}] Сег.{res.jobId:02d}: {res.errorMsg}"
-      add(errors, fmt"Segment {res.jobId}: {res.errorMsg}")
+    hideCursor(stdout)
+    redraw(firstDraw = true)
+
+    while doneCount < actualSegs:
+      # Неблокирующе забираем завершённые сегменты, не мешая перерисовке.
+      var gotAny = false
+      while true:
+        let (avail, res) = tryRecv(resultChan)
+        if not avail: break
+        gotAny = true
+        results[res.jobId]  = res
+        doneMask[res.jobId] = true
+        states[res.jobId]   = if res.success: "done" else: "fail"
+        inc doneCount
+        if not res.success:
+          add(errors, fmt"Segment {res.jobId}: {res.errorMsg}")
+
+      redraw(firstDraw = false)
+      if doneCount < actualSegs:
+        sleep(if gotAny: 0 else: 200)  # без задержки сразу после события
+
+    showCursor(stdout)
+    echo ""
+  else:
+    # Не терминал (лог/pipe) — построчный вывод без перемещения курсора,
+    # чтобы не засорять лог ANSI-кодами.
+    while doneCount < actualSegs:
+      let res = recv(resultChan)
+      results[res.jobId] = res
+      doneMask[res.jobId] = true
+      inc doneCount
+
+      let
+        elapsed = inSeconds(getMonoTime() - wallStart).float
+        eta = if doneCount < actualSegs:
+          elapsed / doneCount.float * (actualSegs - doneCount).float
+        else: 0.0
+
+      if res.success:
+        let sz = if fileExists(res.outputFile):
+          getFileSize(res.outputFile) div (1024*1024) else: 0i64
+        echo fmt"[DONE {doneCount:2d}/{actualSegs}] Сег.{res.jobId:02d}" &
+             fmt" | dec={res.frameCount} enc={res.outFrameCount}" &
+             fmt" dur={res.durationSec:.2f}s" &
+             fmt" | {sz} МБ | ETA {fmtTime(eta)}  {bar(doneCount, actualSegs)}"
+      else:
+        echo fmt"[FAIL  {doneCount:2d}/{actualSegs}] Сег.{res.jobId:02d}: {res.errorMsg}"
+        add(errors, fmt"Segment {res.jobId}: {res.errorMsg}")
 
   for i in 0..<actualSegs: joinThread(threads[i])
 

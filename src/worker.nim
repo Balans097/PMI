@@ -1,5 +1,14 @@
 # ==============================================================================
-#  worker.nim  — pipeline одного сегмента: seek→decode→filter→encode  (v3)
+#  worker.nim  — pipeline одного сегмента: seek→decode→filter→encode  (v1.3)
+#
+#  ИСПРАВЛЕНИЯ v1.3:
+#   • pkt/decFrame/filtFrame/tmpPkt в processSegment были объявлены через
+#     `let`, а defer-блок брал их адрес (`addr pkt`, ...) для av_packet_free/
+#     av_frame_free, которым нужен ptr ptr T, чтобы обнулить указатель после
+#     освобождения. `addr` от `let`-переменной — ошибка компиляции
+#     ("expression has no address"), поэтому проект вообще не собирался.
+#     Исправлено на `var`.
+#   • Убран неиспользуемый import std/math.
 #
 #  ИСПРАВЛЕНИЯ v3:
 #   • Сегмент пишет ТОЛЬКО «чистые» кадры из окна [startSec, startSec+cleanDur).
@@ -13,7 +22,7 @@
 #   • flushEncoder вызывается ровно один раз, после drainFilter.
 # ==============================================================================
 
-import std/[strformat, strutils, os, math]
+import std/[strformat, strutils, os]
 import ffmpeg_api
 
 # Сколько секунд декодируем ДО startSec, чтобы minterpolate получил контекст
@@ -53,6 +62,50 @@ type
 var resultChan*: Channel[SegmentResult]
 
 # ------------------------------------------------------------------------------
+# Живой прогресс по сегментам — для терминального UI в PMI.nim
+#
+# Обычный `seq[int64]`, шарённый как global var между потоками, потребовал
+# бы аккуратной GC-safety аргументации (ORC в целом не против конкурентного
+# доступа к seq[int64] значений без ref-полей, но это неочевидно и хрупко
+# при апгрейде компилятора). Вместо этого используем allocShared —
+# управляемую вручную область памяти вне GC, ровно для этого и созданную
+# в Nim (тот же примитив, на котором построены Channel). Каждый воркер
+# пишет ТОЛЬКО в свой индекс (progressBuf[job.jobId]), main поток только
+# читает — конкурентной записи в одну ячейку никогда не происходит, так
+# что синхронизация (мьютекс/atomic) не нужна: худший случай — main
+# увидит чуть устаревшее (но не «мусорное») значение на один кадр позже.
+# ------------------------------------------------------------------------------
+var
+  progressBuf: ptr UncheckedArray[int64]
+  progressLen: int = 0
+
+proc initProgress*(n: int) {.gcsafe.} =
+  ## Вызывается из main() ДО createThread — переаллокация не потокобезопасна,
+  ## но на момент вызова воркеры ещё не запущены.
+  if progressBuf != nil:
+    deallocShared(progressBuf)
+    progressBuf = nil
+  progressLen = n
+  if n > 0:
+    progressBuf = cast[ptr UncheckedArray[int64]](allocShared0(n * sizeof(int64)))
+
+proc freeProgress*() {.gcsafe.} =
+  if progressBuf != nil:
+    deallocShared(progressBuf)
+    progressBuf = nil
+  progressLen = 0
+
+proc setProgress(jobId: int; frames: int64) {.inline, gcsafe.} =
+  if progressBuf != nil and jobId >= 0 and jobId < progressLen:
+    progressBuf[jobId] = frames
+
+proc getProgress*(jobId: int): int64 {.inline, gcsafe.} =
+  if progressBuf != nil and jobId >= 0 and jobId < progressLen:
+    progressBuf[jobId]
+  else:
+    0'i64
+
+# ------------------------------------------------------------------------------
 # Внутренняя структура
 # ------------------------------------------------------------------------------
 type
@@ -80,6 +133,7 @@ type
     outFmt*:    ptr AVFormatContext
     encCtx*:    ptr AVCodecContext
     outVidIdx*: cint
+    jobId*:     int    # для live-прогресса (см. setProgress/getProgress выше)
 
 # ------------------------------------------------------------------------------
 # Строка фильтра
@@ -230,6 +284,7 @@ proc writeFilteredFrame(p: var Pipeline;
   filtFrame.pts = ptsCounter
   inc ptsCounter
   inc outFrameCount
+  setProgress(p.jobId, outFrameCount)
 
   # frame.pict_type наследуется от исходного декодированного кадра
   # (в источнике есть B-кадры) и пробрасывается фильтром как есть. Если не
@@ -323,6 +378,7 @@ proc processSegment*(job: SegmentJob): SegmentResult =
     success:    false)
 
   var p: Pipeline
+  p.jobId = job.jobId
 
   try:
     # ── 1. Открытие входного файла ───────────────────────────────────────
@@ -431,7 +487,7 @@ proc processSegment*(job: SegmentJob): SegmentResult =
     # Пишем только кадры в [startSec, startSec + cleanDuration)
     let writeEndSec = job.startTime + job.cleanDuration
 
-    let
+    var
       pkt       = av_packet_alloc()
       decFrame  = av_frame_alloc()
       filtFrame = av_frame_alloc()
